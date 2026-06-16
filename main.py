@@ -4,7 +4,7 @@ Telegram-бот для личного использования в группе
 Команды:
   /ping                              — проверка отклика + аптайм
   /t, /timer, "тайм", "таймер"       — установка таймера
-  /my_timers, "таймеры"              — список своих таймеров
+  /mytimers, "таймеры"              — список своих таймеров
   /del, /del_timer, /cancel,
   "удалить", "отмена"                — удаление таймера
   /start, /help                      — справка
@@ -224,8 +224,9 @@ def _send_timer_usage_hint(message: types.Message):
         message,
         "⚠️ Не удалось распознать команду таймера.\n\n"
         "Используйте формат: <code>[команда] [время] [описание]</code>\n"
-        "Время задаётся буквами д/ч/м/с, например:\n"
+        "Время задаётся буквами д/ч/м/с или d/h/m/s, например:\n"
         "<code>/t 1д5ч30с проверить код</code>\n"
+        "<code>/t 1d5h30s check code</code>\n"
         "<code>/t 10с</code> (описание не обязательно)",
     )
 
@@ -271,6 +272,7 @@ def _show_my_timers(message: types.Message):
         lines.append(f"• #{tid}: осталось {format_duration(remaining)}{desc_part}")
 
     lines.append("\nДля удаления используйте: <code>/del [ID]</code>")
+    lines.append("Список всех таймеров: <code>/mytimers</code>")
     bot.reply_to(message, "\n".join(lines))
 
 
@@ -279,7 +281,7 @@ def _send_cancel_usage_hint(message: types.Message):
         message,
         "⚠️ Укажите ID таймера для удаления.\n"
         "Формат: <code>/del [ID]</code> или <code>удалить [ID]</code>\n"
-        "Посмотреть свои ID можно командой /my_timers.",
+        "Посмотреть свои ID можно командой /mytimers.",
     )
 
 
@@ -438,7 +440,7 @@ HELP_TEXT = (
     "<b>⏰ Таймер</b>\n"
     "<code>/t [время] [описание]</code>\n"
     "Синонимы: <code>/timer</code>, <code>таймер</code>, <code>тайм</code>\n"
-    "Время: <code>д</code>/<code>ч</code>/<code>м</code>/<code>с</code> "
+    "Время: <code>д/ч/м/с</code> или <code>d/h/m/s</code> "
     "(дни/часы/минуты/секунды), можно комбинировать.\n"
     "Описание необязательно. По срабатыванию бот напишет в чат и упомянет вас.\n"
     "Примеры:\n"
@@ -446,13 +448,13 @@ HELP_TEXT = (
     "  <code>/t 5м вытащить мясо с морозильника</code>\n\n"
 
     "<b>📑 Мои таймеры</b>\n"
-    "<code>/my_timers</code> или <code>таймеры</code>\n"
+    "<code>/mytimers</code> или <code>таймеры</code>\n"
     "Список активных таймеров с ID и оставшимся временем.\n\n"
 
     "<b>🗑 Удалить таймер</b>\n"
     "<code>/del [ID]</code>\n"
     "Синонимы: <code>/cancel</code>, <code>удалить</code>, <code>отмена</code>\n"
-    "ID берётся из <code>/my_timers</code>.\n"
+    "ID берётся из <code>/mytimers</code>.\n"
     "Пример: <code>/del 3</code>\n\n"
 
     "🏓 <code>/ping</code>\n"
@@ -508,7 +510,7 @@ def handle_timer_text(message: types.Message):
     _process_timer_request(message, args_text)
 
 
-@bot.message_handler(commands=["my_timers"])
+@bot.message_handler(commands=["mytimers"])
 def handle_my_timers_command(message: types.Message):
     _show_my_timers(message)
 
