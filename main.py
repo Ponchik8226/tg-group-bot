@@ -272,7 +272,6 @@ def _show_my_timers(message: types.Message):
         lines.append(f"• #{tid}: осталось {format_duration(remaining)}{desc_part}")
 
     lines.append("\nДля удаления используйте: <code>/del [ID]</code>")
-    lines.append("Список всех таймеров: <code>/mytimers</code>")
     bot.reply_to(message, "\n".join(lines))
 
 
