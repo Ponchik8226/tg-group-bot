@@ -7,35 +7,14 @@
 
 Если DATABASE_URL не задан (или не установлен psycopg2), все функции
 работают как no-op — бот продолжает работать только в памяти.
-
-Подключения к БД управляются через пул (ThreadedConnectionPool):
-  - при старте создаётся 1 соединение, максимум 5 одновременных
-  - каждая функция берёт соединение из пула и возвращает обратно
-  - это исключает накладные расходы на установку нового TCP-соединения
-    при каждом запросе и делает работу с БД быстрее и стабильнее
 """
-
-import time
 
 from config import DATABASE_URL, logger
 
 try:
     import psycopg2
-    from psycopg2 import pool as psycopg2_pool
 except ImportError:
     psycopg2 = None
-    psycopg2_pool = None
-
-
-# =============================================================================
-#                          ПУЛ СОЕДИНЕНИЙ
-# =============================================================================
-
-# Глобальный пул: инициализируется один раз в init_db().
-# min=1 — одно соединение всегда держится открытым (нет cold start на Neon).
-# max=5 — не более 5 одновременных соединений (хватает для фоновых потоков
-#          статистики + основного потока polling + таймеров).
-_pool = None
 
 
 def db_enabled() -> bool:
@@ -43,43 +22,9 @@ def db_enabled() -> bool:
     return bool(DATABASE_URL) and psycopg2 is not None
 
 
-def _init_pool():
-    """
-    Создаёт пул соединений. Если Neon ещё "спит" после паузы —
-    повторяет попытку до 5 раз с паузой 3 секунды.
-    """
-    global _pool
-
-    for attempt in range(1, 6):
-        try:
-            _pool = psycopg2_pool.ThreadedConnectionPool(
-                minconn=1,
-                maxconn=5,
-                dsn=DATABASE_URL,
-            )
-            logger.info("Пул соединений с БД создан.")
-            return
-        except Exception as e:
-            logger.warning(
-                "Попытка %s/5 подключиться к БД не удалась: %s. "
-                "Повтор через 3 секунды...", attempt, e,
-            )
-            time.sleep(3)
-
-    logger.error(
-        "Не удалось подключиться к БД после 5 попыток. "
-        "Бот продолжит работу без базы данных."
-    )
-
-
-def _get_conn():
-    """Берёт соединение из пула."""
-    return _pool.getconn()
-
-
-def _put_conn(conn):
-    """Возвращает соединение в пул."""
-    _pool.putconn(conn)
+def db_connect():
+    """Открывает новое подключение к Postgres."""
+    return psycopg2.connect(DATABASE_URL)
 
 
 # =============================================================================
@@ -87,7 +32,7 @@ def _put_conn(conn):
 # =============================================================================
 
 def init_db():
-    """Инициализирует пул и создаёт все необходимые таблицы."""
+    """Создаёт все необходимые таблицы, если их ещё нет."""
     if not db_enabled():
         logger.warning(
             "DATABASE_URL не задан — таймеры и статистика не будут "
@@ -95,12 +40,7 @@ def init_db():
         )
         return
 
-    _init_pool()
-
-    if _pool is None:
-        return
-
-    conn = _get_conn()
+    conn = db_connect()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -158,7 +98,7 @@ def init_db():
                     """
                 )
     finally:
-        _put_conn(conn)
+        conn.close()
 
 
 # =============================================================================
@@ -167,10 +107,10 @@ def init_db():
 
 def insert_timer(chat_id, user_id, first_name, description, end_time):
     """Сохраняет таймер в базу и возвращает его ID (или None без БД)."""
-    if not db_enabled() or _pool is None:
+    if not db_enabled():
         return None
 
-    conn = _get_conn()
+    conn = db_connect()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -181,29 +121,29 @@ def insert_timer(chat_id, user_id, first_name, description, end_time):
                 )
                 return cur.fetchone()[0]
     finally:
-        _put_conn(conn)
+        conn.close()
 
 
 def delete_timer(timer_id):
     """Удаляет таймер из базы."""
-    if not db_enabled() or _pool is None:
+    if not db_enabled():
         return
 
-    conn = _get_conn()
+    conn = db_connect()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM timers WHERE id = %s", (timer_id,))
     finally:
-        _put_conn(conn)
+        conn.close()
 
 
 def load_all_timers():
     """Возвращает все сохранённые таймеры: (id, chat_id, user_id, first_name, description, end_time)."""
-    if not db_enabled() or _pool is None:
+    if not db_enabled():
         return []
 
-    conn = _get_conn()
+    conn = db_connect()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -213,7 +153,7 @@ def load_all_timers():
                 )
                 return cur.fetchall()
     finally:
-        _put_conn(conn)
+        conn.close()
 
 
 # =============================================================================
@@ -262,10 +202,10 @@ def record_message_stats(
     chars, stickers, photos, videos, voice, gifs,
 ):
     """Обновляет данные пользователя, чата и счётчики по одному сообщению."""
-    if not db_enabled() or _pool is None:
+    if not db_enabled():
         return
 
-    conn = _get_conn()
+    conn = db_connect()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -276,12 +216,12 @@ def record_message_stats(
                     (user_id, chat_id, chars, stickers, photos, videos, voice, gifs),
                 )
     finally:
-        _put_conn(conn)
+        conn.close()
 
 
 def get_stats_overview():
     """Возвращает (total_users, total_chats, totals_dict) с суммарными счётчиками."""
-    conn = _get_conn()
+    conn = db_connect()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -309,7 +249,7 @@ def get_stats_overview():
                     photos, videos, voice, gifs,
                 ) = cur.fetchone()
     finally:
-        _put_conn(conn)
+        conn.close()
 
     totals = {
         "messages": messages,
@@ -328,7 +268,7 @@ def get_top_activity(limit=10):
     Возвращает топ записей (пользователь, чат) по количеству сообщений:
     (username, first_name, chat_title, messages, chars, stickers, photos, videos, voice, gifs)
     """
-    conn = _get_conn()
+    conn = db_connect()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -347,4 +287,4 @@ def get_top_activity(limit=10):
                 )
                 return cur.fetchall()
     finally:
-        _put_conn(conn)
+        conn.close()
