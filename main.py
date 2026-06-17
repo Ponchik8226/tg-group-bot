@@ -272,7 +272,6 @@ def _show_my_timers(message: types.Message):
         lines.append(f"• #{tid}: осталось {format_duration(remaining)}{desc_part}")
 
     lines.append("\nДля удаления используйте: <code>/del [ID]</code>")
-    lines.append("Список всех таймеров: <code>/mytimers</code>")
     bot.reply_to(message, "\n".join(lines))
 
 
@@ -421,14 +420,6 @@ def stats_middleware(bot_instance, message):
     Запись в БД выполняется в отдельном потоке, чтобы не задерживать
     ответ бота на текущую команду.
     """
-    # ОТЛАДКА: логируем каждого отправителя чтобы убедиться что бот видит BFG
-    # Удалить после подтверждения что фильтрация работает.
-    user = message.from_user
-    if user:
-        logger.info(
-            "[DEBUG] Сообщение от user_id=%s is_bot=%s имя=%s",
-            user.id, user.is_bot, user.first_name,
-        )
     def _track():
         try:
             track_message_stats(message)
@@ -566,103 +557,6 @@ def handle_stats(message: types.Message):
         bot.send_message(message.chat.id, chunk)
 
 
-
-
-# =============================================================================
-#                  ФИЛЬТРАЦИЯ РЕКЛАМЫ BFG-БОТА
-# =============================================================================
-
-# ID BFG-бота — замени на реальный когда узнаешь его.
-BFG_BOT_ID = 2108172242
-
-# Тег клана — если он есть в сообщении, значит это полезный игровой ответ.
-CLAN_TAG = "『FSB』"
-
-# Признаки рекламы — ссылки в тексте.
-_AD_MARKERS = ("t.me/", "http")
-
-
-def _has_ad_link(message: types.Message) -> bool:
-    """
-    Проверяет наличие рекламных ссылок в сообщении.
-    Проверяет два места:
-      1. Сам текст/подпись — на случай голых ссылок вида "t.me/..." или "http..."
-      2. Entities — на случай Markdown-ссылок вида [текст](url), где URL
-         скрыт и в тексте не виден, но присутствует в метаданных сообщения.
-    """
-    text = message.text or message.caption or ""
-
-    # Проверка 1: голые ссылки в тексте
-    if any(marker in text for marker in _AD_MARKERS):
-        return True
-
-    # Проверка 2: скрытые ссылки в entities (Markdown [текст](url))
-    entities = message.entities or message.caption_entities or []
-    for entity in entities:
-        if entity.type in ("url", "text_link"):
-            url = entity.url or ""  # text_link хранит url в атрибуте
-            if any(marker in url for marker in _AD_MARKERS):
-                return True
-
-    return False
-
-
-@bot.message_handler(
-    func=lambda m: m.from_user is not None and m.from_user.id == BFG_BOT_ID
-)
-def handle_bfg_message(message: types.Message):
-    """
-    Перехватывает все сообщения от BFG-бота и удаляет чистую рекламу.
-
-    Логика:
-      - Берём текст из message.text или message.caption (фото с подписью).
-      - Если текст содержит рекламную ссылку (t.me/ или http) И при этом
-        НЕТ тега клана 『FSB』 — это спам, удаляем.
-      - Если тег клана есть — это ответ на игровую команду, не трогаем.
-      - Если нет ни ссылки, ни тега — обычное сообщение, не трогаем.
-    """
-    # Собираем весь текст сообщения для проверки тега клана
-    text = message.text or message.caption or ""
-
-    # Есть ли в сообщении рекламная ссылка (в тексте или в entities)?
-    has_ad = _has_ad_link(message)
-
-    if not has_ad:
-        return
-
-    # Есть ссылка — проверяем есть ли тег клана
-    if CLAN_TAG in text:
-        return
-
-    # Ссылка есть, тега клана нет — чистый спам, удаляем
-    try:
-        bot.delete_message(message.chat.id, message.message_id)
-        logger.info(
-            "Удалено рекламное сообщение от BFG-бота (chat_id=%s, message_id=%s).",
-            message.chat.id, message.message_id,
-        )
-    except telebot.apihelper.ApiTelegramException as e:
-        if e.error_code == 400 and "message to delete not found" in e.description:
-            # Сообщение уже удалено (например, кто-то успел раньше)
-            pass
-        elif e.error_code in (400, 403):
-            # Нет прав на удаление — уведомляем в чат
-            logger.warning(
-                "Нет прав удалить сообщение BFG-бота (chat_id=%s): %s",
-                message.chat.id, e.description,
-            )
-            bot.send_message(
-                message.chat.id,
-                "⚠️ Обнаружена реклама от BFG-бота, но у меня нет прав на удаление сообщений.\n"
-                "Выдай мне права администратора с разрешением «Удаление сообщений».",
-            )
-        else:
-            logger.exception(
-                "Неожиданная ошибка при удалении сообщения BFG-бота (chat_id=%s, message_id=%s).",
-                message.chat.id, message.message_id,
-            )
-
-
 # =============================================================================
 #                  ВЕБ-СЕРВЕР (WEBHOOK + HEALTHCHECK)
 # =============================================================================
@@ -727,9 +621,6 @@ def main():
     bot.set_webhook(
         url=f"{webhook_url}/webhook",
         drop_pending_updates=True,
-        # Явно указываем типы обновлений — без этого Telegram не присылает
-        # сообщения от других ботов (нужно для фильтрации рекламы BFG-бота).
-        allowed_updates=["message", "edited_message", "channel_post"],
     )
     logger.info("Webhook зарегистрирован: %s/webhook", webhook_url)
 
