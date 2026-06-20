@@ -226,7 +226,6 @@ def _send_timer_usage_hint(message: types.Message):
         "Используйте формат: <code>[команда] [время] [описание]</code>\n"
         "Время задаётся буквами д/ч/м/с или d/h/m/s, например:\n"
         "<code>/t 1д5ч30с проверить код</code>\n"
-        "<code>/t 1d5h30s check code</code>\n"
         "<code>/t 10с</code> (описание не обязательно)",
     )
 
@@ -320,7 +319,35 @@ def track_message_stats(message: types.Message):
     else:
         chat_title = chat.title or str(chat.id)
 
+    # Пересланные сообщения — считаем только как пересыл, остальные счётчики
+    # не трогаем (это чужой контент, не активность пользователя).
+    is_forward = (
+        message.forward_origin is not None
+        or message.forward_from is not None
+        or message.forward_from_chat is not None
+        or message.forward_sender_name is not None
+    )
+    if is_forward:
+        database.record_message_stats(
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            chat_id=chat.id,
+            chat_type=chat.type,
+            chat_title=chat_title,
+            messages=0, chars=0, stickers=0, photos=0,
+            videos=0, voice=0, gifs=0, forwards=1,
+        )
+        return
+
     content_type = message.content_type
+
+    # messages_count: считаем все типы сообщений кроме стикеров.
+    # Стикер — отдельная единица общения, идёт только в stickers_count.
+    is_sticker = content_type == "sticker"
+    messages = 0 if is_sticker else 1
+
     chars = stickers = photos = videos = voice = gifs = 0
 
     if content_type == "text":
@@ -349,12 +376,14 @@ def track_message_stats(message: types.Message):
         chat_id=chat.id,
         chat_type=chat.type,
         chat_title=chat_title,
+        messages=messages,
         chars=chars,
         stickers=stickers,
         photos=photos,
         videos=videos,
         voice=voice,
         gifs=gifs,
+        forwards=0,
     )
 
 
@@ -375,6 +404,7 @@ def build_stats_report() -> str:
         f"🎬 Видео: {totals['videos']}",
         f"🎤 Голосовых: {totals['voice']}",
         f"🎞 GIF: {totals['gifs']}",
+        f"↩️ Пересланных: {totals['forwards']}",
     ]
 
     if top_rows:
@@ -382,7 +412,7 @@ def build_stats_report() -> str:
         lines.append("<b>🏆 Топ-10 по активности</b>")
         for i, row in enumerate(top_rows, start=1):
             (username, first_name, chat_title,
-             messages, chars, stickers, photos, videos, voice, gifs) = row
+             messages, chars, stickers, photos, videos, voice, gifs, forwards) = row
 
             display_name = f"@{username}" if username else (first_name or "Без имени")
             display_name = html.escape(display_name)
@@ -399,6 +429,8 @@ def build_stats_report() -> str:
                 extra_parts.append(f"голосовые {voice}")
             if gifs:
                 extra_parts.append(f"gif {gifs}")
+            if forwards:
+                extra_parts.append(f"пересланных {forwards}")
             extra = f" ({', '.join(extra_parts)})" if extra_parts else ""
 
             lines.append(
@@ -444,7 +476,6 @@ HELP_TEXT = (
     "Описание необязательно. По срабатыванию бот напишет в чат и упомянет вас.\n"
     "Примеры:\n"
     "  <code>/t 1д5ч30с купить продукты</code>\n"
-    "  <code>/t 2h30m buy groceries</code>\n"
     "  <code>/t 5м вытащить мясо с морозильника</code>\n\n"
 
     "<b>📑 Мои таймеры</b>\n"
