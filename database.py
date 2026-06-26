@@ -704,3 +704,60 @@ def get_chats_top_page(offset: int, limit: int = 10):
         return rows, total
     finally:
         _put_conn(conn)
+
+
+def get_chats_count_by_type():
+    """
+    Возвращает (group_count, private_count) — количество бесед и личок.
+    """
+    if not db_enabled() or _pool is None:
+        return 0, 0
+
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (WHERE chat_type != 'private'),
+                        COUNT(*) FILTER (WHERE chat_type = 'private')
+                    FROM chats
+                    """
+                )
+                return cur.fetchone()
+    finally:
+        _put_conn(conn)
+
+
+def get_top_activity_groups(limit: int = 5):
+    """
+    Топ пользователей только из групповых чатов (без ЛС).
+    Возвращает (user_id, username, first_name, chat_title, messages, chars,
+                stickers, photos, videos, voice, gifs, forwards)
+    """
+    if not db_enabled() or _pool is None:
+        return []
+
+    conn = _get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT u.user_id, u.username, u.first_name, c.title,
+                           s.messages_count, s.chars_count, s.stickers_count,
+                           s.photos_count, s.videos_count, s.voice_count,
+                           s.gifs_count, s.forwards_count
+                    FROM user_chat_stats s
+                    JOIN users u ON u.user_id = s.user_id
+                    JOIN chats c ON c.chat_id = s.chat_id
+                    WHERE c.chat_type != 'private'
+                    ORDER BY s.messages_count DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                return cur.fetchall()
+    finally:
+        _put_conn(conn)

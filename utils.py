@@ -10,12 +10,22 @@ import time
 
 START_TIME = time.time()
 
-
 # "1д5ч30м10с" или "1d5h30m10s" -> компоненты, все группы опциональны
 _TIME_PATTERN = re.compile(
     r"^(?:(\d+)[дd])?(?:(\d+)[чh])?(?:(\d+)[мm])?(?:(\d+)[сs])?$",
     re.IGNORECASE,
 )
+
+# Эмодзи-цифры для топов (1-10, дальше обычные числа)
+_EMOJI_DIGITS = {
+    1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣",
+    6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣", 10: "🔟",
+}
+
+
+def rank_label(n: int) -> str:
+    """Возвращает эмодзи-цифру для позиции n (1-10) или обычное число."""
+    return _EMOJI_DIGITS.get(n, f"{n}.")
 
 
 def parse_duration(time_str: str):
@@ -64,6 +74,20 @@ def build_mention(user_id: int, first_name: str) -> str:
     return f'<a href="tg://user?id={user_id}">{display_name}</a>'
 
 
+def build_clickable_name(user_id: int, username: str | None, first_name: str | None) -> str:
+    """
+    Кликабельное имя пользователя для топов.
+    Если есть username — показываем @username как ссылку.
+    Если нет — показываем first_name как ссылку через tg://user?id=.
+    В любом случае ссылка кликабельна и открывает профиль.
+    """
+    if username:
+        display = html.escape(f"@{username}")
+    else:
+        display = html.escape(first_name or "Без имени")
+    return f'<a href="tg://user?id={user_id}">{display}</a>'
+
+
 def get_uptime_str() -> str:
     """Аптайм бота с момента запуска, например "1д 5ч 30м 10с"."""
     uptime_seconds = int(time.time() - START_TIME)
@@ -104,17 +128,20 @@ def split_message(text: str, limit: int = 4000):
 
 
 def build_stats_report() -> str:
-    """Формирует текст отчёта /стата: сводка + топ-10 по активности."""
+    """Формирует текст отчёта /стата: сводка + топ-5 по активности (только из бесед)."""
     import database  # импорт здесь чтобы избежать циклических зависимостей
 
-    total_users, total_chats, totals = database.get_stats_overview()
-    top_rows = database.get_top_activity(limit=10)
+    total_users, _, totals = database.get_stats_overview()
+    group_count, private_count = database.get_chats_count_by_type()
+    # Топ-5 только из групп (chat_type != 'private')
+    top_rows = database.get_top_activity_groups(limit=5)
 
     lines = [
         "<b>📊 Общая статистика</b>",
         "",
         f"👤 Пользователей: {total_users}",
-        f"💬 Чатов: {total_chats}",
+        f"💬 Бесед: {group_count}",
+        f"📩 Личок: {private_count}",
         f"✉️ Сообщений: {totals['messages']}",
         f"🔠 Символов: {totals['chars']}",
         f"🎟 Стикеров: {totals['stickers']}",
@@ -127,13 +154,12 @@ def build_stats_report() -> str:
 
     if top_rows:
         lines.append("")
-        lines.append("<b>🏆 Топ-10 по активности</b>")
+        lines.append("<b>🏆 Топ-5 активных (беседы)</b>")
         for i, row in enumerate(top_rows, start=1):
-            (username, first_name, chat_title,
-             messages, chars, stickers, photos, videos, voice, gifs, forwards) = row
+            user_id, username, first_name, chat_title, \
+                messages, chars, stickers, photos, videos, voice, gifs, forwards = row
 
-            display_name = f"@{username}" if username else (first_name or "Без имени")
-            display_name = html.escape(display_name)
+            name = build_clickable_name(user_id, username, first_name)
             chat_label = html.escape(chat_title or "Без названия")
 
             extra_parts = []
@@ -152,8 +178,8 @@ def build_stats_report() -> str:
             extra = f" ({', '.join(extra_parts)})" if extra_parts else ""
 
             lines.append(
-                f"{i}. {display_name} — {chat_label}: "
-                f"{messages} сообщ., {chars} симв.{extra}"
+                f"{rank_label(i)} {name} — {chat_label}: "
+                f"{messages} сообщений, {chars} символов{extra}"
             )
 
     return "\n".join(lines)

@@ -19,7 +19,7 @@ from telebot import types
 
 import database
 from config import bot, logger, ADMIN_IDS
-from utils import split_message, build_stats_report
+from utils import split_message, build_stats_report, build_clickable_name, rank_label
 
 
 # =============================================================================
@@ -37,9 +37,9 @@ def _is_admin_in_pm(message: types.Message) -> bool:
     )
 
 
-def _fmt_user(username, first_name) -> str:
-    display = f"@{username}" if username else (first_name or "Без имени")
-    return html.escape(display)
+def _fmt_user(user_id: int, username, first_name) -> str:
+    """Кликабельное имя пользователя через build_clickable_name из utils."""
+    return build_clickable_name(user_id, username, first_name)
 
 
 def _fmt_row_stats(messages, chars, stickers, photos, videos, voice, gifs, forwards) -> str:
@@ -93,11 +93,11 @@ def _build_global_page(page: int):
 
     lines = [f"<b>🌍 Глобальный топ — стр. {page + 1}/{pages}</b>", ""]
     for i, row in enumerate(rows, start=offset + 1):
-        _, username, first_name, chat_title = row[0], row[1], row[2], row[3]
+        user_id, username, first_name, chat_title = row[0], row[1], row[2], row[3]
         stats = row[4:]
-        name = _fmt_user(username, first_name)
+        name = _fmt_user(user_id, username, first_name)
         chat = html.escape(chat_title or "?")
-        lines.append(f"{i}. {name} ({chat}) — {_fmt_row_stats(*stats)}")
+        lines.append(f"{rank_label(i)} {name} ({chat}) — {_fmt_row_stats(*stats)}")
 
     if not rows:
         lines.append("Нет данных.")
@@ -120,10 +120,10 @@ def _build_chat_page(chat_id: int, chat_title: str, page: int):
     title_escaped = html.escape(chat_title or str(chat_id))
     lines = [f"<b>💬 Топ «{title_escaped}» — стр. {page + 1}/{pages}</b>", ""]
     for i, row in enumerate(rows, start=offset + 1):
-        _, username, first_name = row[0], row[1], row[2]
+        user_id, username, first_name = row[0], row[1], row[2]
         stats = row[3:]
-        name = _fmt_user(username, first_name)
-        lines.append(f"{i}. {name} — {_fmt_row_stats(*stats)}")
+        name = _fmt_user(user_id, username, first_name)
+        lines.append(f"{rank_label(i)} {name} — {_fmt_row_stats(*stats)}")
 
     if not rows:
         lines.append("Нет данных.")
@@ -148,7 +148,7 @@ def _build_chats_top_page(page: int):
         _, title, messages, chars, stickers, photos, videos, voice, gifs, forwards = row
         title_e = html.escape(title or "Без названия")
         stats = _fmt_row_stats(messages, chars, stickers, photos, videos, voice, gifs, forwards)
-        lines.append(f"{i}. {title_e} — {stats}")
+        lines.append(f"{rank_label(i)} {title_e} — {stats}")
 
     if not rows:
         lines.append("Нет данных.")
@@ -407,7 +407,7 @@ def register(bot_username: str):
         user_id, username, first_name, last_name, registered_at, last_seen_at = user_row
         chat_stats = database.get_user_stats_all_chats(user_id)
 
-        display = _fmt_user(username, first_name)
+        display = build_clickable_name(user_id, username, first_name)
         full_name_parts = [first_name or "", last_name or ""]
         full_name = html.escape(" ".join(p for p in full_name_parts if p).strip() or "—")
 
