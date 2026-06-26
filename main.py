@@ -251,6 +251,10 @@ def _process_timer_request(message: types.Message, args_text: str):
         _send_timer_usage_hint(message)
         return
 
+    if duration_seconds < 5:
+        bot.reply_to(message, "⚠️ Минимальное время таймера — 5 секунд.")
+        return
+
     if duration_seconds > MAX_TIMER_DURATION:
         bot.reply_to(
             message,

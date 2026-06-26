@@ -562,7 +562,7 @@ def register(bot_username: str):
 
 
 def _build_chat_stats_text(chat_id: int, chat_title: str) -> str:
-    """Формирует текст статистики конкретного чата."""
+    """Формирует текст статистики конкретного чата + топ-5 участников."""
     row = database.get_chat_stats(chat_id)
     if not row:
         return f"❌ Нет данных по чату «{html.escape(chat_title or str(chat_id))}»."
@@ -583,4 +583,16 @@ def _build_chat_stats_text(chat_id: int, chat_title: str) -> str:
         f"🎞 GIF: {gifs}",
         f"↩️ Пересланных: {forwards}",
     ]
+
+    # Топ-5 участников этой беседы
+    top_rows, _ = database.get_chat_top_page(chat_id, 0, 5)
+    if top_rows:
+        lines.append("")
+        lines.append("<b>🏆 Топ-5 участников</b>")
+        for i, top_row in enumerate(top_rows, start=1):
+            user_id, username, first_name = top_row[0], top_row[1], top_row[2]
+            stats = top_row[3:]
+            name = build_clickable_name(user_id, username, first_name)
+            lines.append(f"{rank_label(i)} {name} — {_fmt_row_stats(*stats)}")
+
     return "\n".join(lines)
