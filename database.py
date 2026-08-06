@@ -552,6 +552,150 @@ def get_user_stats_all_chats(user_id: int):
     return _run(_fn)
 
 
+def get_chats_count_by_type():
+    """
+    Возвращает (group_count, private_count) — количество бесед и личок.
+    Используется в build_stats_report() (utils.py).
+    """
+    if not db_enabled() or _pool is None:
+        return 0, 0
+
+    def _fn(conn):
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (WHERE chat_type != 'private'),
+                        COUNT(*) FILTER (WHERE chat_type = 'private')
+                    FROM chats
+                    """
+                )
+                return cur.fetchone()
+
+    return _run(_fn)
+
+
+def get_top_activity_groups(limit: int = 5):
+    """
+    Топ пользователей по сообщениям — только из групп (не лички).
+    Возвращает список: (user_id, username, first_name, chat_title,
+                        messages, chars, stickers, photos, videos, voice, gifs, forwards).
+    Используется в build_stats_report() (utils.py).
+    """
+    if not db_enabled() or _pool is None:
+        return []
+
+    def _fn(conn):
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT u.user_id, u.username, u.first_name, c.title,
+                           s.messages_count, s.chars_count, s.stickers_count,
+                           s.photos_count, s.videos_count, s.voice_count,
+                           s.gifs_count, s.forwards_count
+                    FROM user_chat_stats s
+                    JOIN users u ON u.user_id = s.user_id
+                    JOIN chats c ON c.chat_id = s.chat_id
+                    WHERE c.chat_type != 'private'
+                    ORDER BY s.messages_count DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                return cur.fetchall()
+
+    return _run(_fn)
+
+
+def get_chats_top_page(offset: int, limit: int = 10):
+    """
+    Топ бесед по суммарной активности с пагинацией (только группы, без личек).
+    Возвращает (rows, total_count).
+    rows: (chat_id, title, messages, chars, stickers, photos, videos, voice, gifs, forwards)
+    Используется в _build_chats_top_page() (admin.py).
+    """
+    if not db_enabled() or _pool is None:
+        return [], 0
+
+    def _fn(conn):
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(DISTINCT s.chat_id)
+                    FROM user_chat_stats s
+                    JOIN chats c ON c.chat_id = s.chat_id
+                    WHERE c.chat_type != 'private'
+                    """
+                )
+                total = cur.fetchone()[0]
+
+                cur.execute(
+                    """
+                    SELECT c.chat_id, c.title,
+                           SUM(s.messages_count)  AS messages,
+                           SUM(s.chars_count)      AS chars,
+                           SUM(s.stickers_count)   AS stickers,
+                           SUM(s.photos_count)     AS photos,
+                           SUM(s.videos_count)     AS videos,
+                           SUM(s.voice_count)      AS voice,
+                           SUM(s.gifs_count)       AS gifs,
+                           SUM(s.forwards_count)   AS forwards
+                    FROM user_chat_stats s
+                    JOIN chats c ON c.chat_id = s.chat_id
+                    WHERE c.chat_type != 'private'
+                    GROUP BY c.chat_id, c.title
+                    ORDER BY messages DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (limit, offset),
+                )
+                return cur.fetchall(), total
+
+    return _run(_fn)
+
+
+def get_chat_stats(chat_id: int):
+    """
+    Агрегированная статистика по конкретному чату.
+    Возвращает (participants, messages, chars, stickers, photos, videos, voice, gifs, forwards)
+    или None если чат не найден / нет данных.
+    Используется в _build_chat_stats_text() (admin.py).
+    """
+    if not db_enabled() or _pool is None:
+        return None
+
+    def _fn(conn):
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(DISTINCT user_id)     AS participants,
+                        SUM(messages_count)         AS messages,
+                        SUM(chars_count)            AS chars,
+                        SUM(stickers_count)         AS stickers,
+                        SUM(photos_count)           AS photos,
+                        SUM(videos_count)           AS videos,
+                        SUM(voice_count)            AS voice,
+                        SUM(gifs_count)             AS gifs,
+                        SUM(forwards_count)         AS forwards
+                    FROM user_chat_stats
+                    WHERE chat_id = %s
+                    """,
+                    (chat_id,),
+                )
+                row = cur.fetchone()
+                # Если нет строк или все счётчики NULL (чат есть, но нет сообщений)
+                if row is None or row[0] == 0:
+                    return None
+                return row
+
+    return _run(_fn)
+
+
 def get_stats_overview():
     """Возвращает (total_users, total_chats, totals_dict) с суммарными счётчиками."""
     if not db_enabled() or _pool is None:
