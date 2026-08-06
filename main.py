@@ -70,6 +70,9 @@ def fire_timer(timer_id: int, missed: bool = False):
     Срабатывает по таймеру: тегает пользователя и шлёт описание.
     Если missed=True — таймер сработал, пока бот был выключен.
 
+    Идемпотентен: если таймер уже удалён из TIMERS (сработал через
+    threading.Timer, а поллер тоже попытался его запустить) — просто выходим.
+
     Порядок: сначала отправить сообщение, потом удалить из БД.
     Это исключает ситуацию «удалили из БД, но сообщение не дошло».
     Если send_message упадёт — таймер останется в БД и сработает
@@ -139,12 +142,15 @@ def _check_due_timers():
 
 def _start_timer_poller():
     """
-    Запускает фоновый поток-планировщик, который каждые 30 секунд
-    проверяет таймеры и срабатывает просроченные.
+    Запускает фоновый поток-поллер — страховочная сеть для таймеров.
 
-    Заменяет threading.Timer — надёжно работает при перезапусках бота,
-    так как не хранит состояние в объектах Timer, а читает из памяти
-    (которая восстанавливается из БД при старте).
+    Основная точность обеспечивается threading.Timer (создаётся при
+    каждом новом таймере и при восстановлении из БД после рестарта).
+    Поллер нужен как запасной путь: если threading.Timer умер (рестарт
+    Render в середине длинного таймера), поллер подхватит через ≤30 сек.
+
+    Поскольку fire_timer идемпотентен, двойной вызов (Timer + поллер)
+    безопасен: второй просто найдёт пустое место и тихо выйдет.
     """
     def _poller():
         logger.info("Планировщик таймеров запущен (интервал проверки: 30 сек).")
@@ -160,7 +166,13 @@ def _start_timer_poller():
 
 
 def create_timer(message: types.Message, duration_seconds: int, description: str):
-    """Создаёт таймер: сохраняет в БД и добавляет в память."""
+    """Создаёт таймер: сохраняет в БД и добавляет в память.
+
+    Гибридный подход:
+    - threading.Timer  — срабатывает точно в нужное время
+    - поллер           — страховка на случай перезапуска бота
+    Оба пути безопасны: fire_timer идемпотентен.
+    """
     global _next_timer_id
 
     user = message.from_user
@@ -168,15 +180,22 @@ def create_timer(message: types.Message, duration_seconds: int, description: str
     mention = build_mention(user.id, first_name)
     end_time = time.time() + duration_seconds
 
-    with _timers_lock:
-        if database.db_enabled():
-            timer_id = database.insert_timer(
-                message.chat.id, user.id, first_name, description, end_time
-            )
-        else:
+    # Получаем ID из БД до захвата лока (БД может быть медленной)
+    if database.db_enabled():
+        timer_id = database.insert_timer(
+            message.chat.id, user.id, first_name, description, end_time
+        )
+    else:
+        with _timers_lock:
             timer_id = _next_timer_id
             _next_timer_id += 1
 
+    # Создаём объект таймера, но не стартуем — чтобы не сработал
+    # раньше, чем запись появится в TIMERS
+    timer_obj = threading.Timer(duration_seconds, fire_timer, args=(timer_id,))
+    timer_obj.daemon = True
+
+    with _timers_lock:
         TIMERS[timer_id] = {
             "chat_id": message.chat.id,
             "user_id": user.id,
@@ -184,8 +203,11 @@ def create_timer(message: types.Message, duration_seconds: int, description: str
             "description": description,
             "end_time": end_time,
             "duration": duration_seconds,
+            "timer_obj": timer_obj,   # нужен для точной отмены через .cancel()
         }
         USER_TIMERS.setdefault(user.id, set()).add(timer_id)
+
+    timer_obj.start()  # стартуем только после попадания в TIMERS
 
     logger.info(
         "Создан таймер #%s на %s сек (user_id=%s, chat_id=%s).",
@@ -210,6 +232,11 @@ def cancel_timer(timer_id: int, user_id: int) -> str:
             return f"❌ Таймер #{timer_id} принадлежит другому пользователю — отменить его может только автор."
         del TIMERS[timer_id]
         USER_TIMERS.get(user_id, set()).discard(timer_id)
+
+    # Отменяем threading.Timer если он ещё не сработал
+    timer_obj = info.get("timer_obj")
+    if timer_obj is not None:
+        timer_obj.cancel()
 
     database.delete_timer(timer_id)
     logger.info("Таймер #%s отменён пользователем %s.", timer_id, user_id)
@@ -237,6 +264,16 @@ def restore_timers():
 
     for timer_id, chat_id, user_id, first_name, description, end_time in rows:
         mention = build_mention(user_id, first_name)
+        remaining = end_time - now
+
+        if remaining > 0:
+            # Таймер ещё не истёк — создаём threading.Timer с остатком времени
+            timer_obj = threading.Timer(remaining, fire_timer, args=(timer_id,))
+            timer_obj.daemon = True
+        else:
+            # Таймер просрочен — поллер подберёт на следующей проверке (~30 сек)
+            timer_obj = None
+
         with _timers_lock:
             TIMERS[timer_id] = {
                 "chat_id": chat_id,
@@ -244,14 +281,16 @@ def restore_timers():
                 "user_mention": mention,
                 "description": description,
                 "end_time": end_time,
-                "duration": max(0, int(end_time - now)),
+                "duration": max(0, int(remaining)),
+                "timer_obj": timer_obj,
             }
             USER_TIMERS.setdefault(user_id, set()).add(timer_id)
 
-        if end_time <= now:
-            missed += 1
-        else:
+        if timer_obj is not None:
+            timer_obj.start()
             restored += 1
+        else:
+            missed += 1
 
     logger.info(
         "Восстановлено таймеров: %s активных, %s просроченных (сработают через ~30 сек).",
