@@ -203,6 +203,19 @@ def init_db():
                     ADD COLUMN IF NOT EXISTS forwards_count BIGINT NOT NULL DEFAULT 0
                     """
                 )
+                # Колонки для повторяющихся таймеров (добавлены в v2)
+                cur.execute(
+                    """
+                    ALTER TABLE timers
+                    ADD COLUMN IF NOT EXISTS is_recurring BOOLEAN NOT NULL DEFAULT FALSE
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE timers
+                    ADD COLUMN IF NOT EXISTS interval_seconds BIGINT NOT NULL DEFAULT 0
+                    """
+                )
 
     _run(_fn)
 
@@ -211,7 +224,10 @@ def init_db():
 # ТАЙМЕРЫ
 # =============================================================================
 
-def insert_timer(chat_id, user_id, first_name, description, end_time):
+def insert_timer(
+    chat_id, user_id, first_name, description, end_time,
+    is_recurring: bool = False, interval_seconds: int = 0,
+):
     """Сохраняет таймер в базу и возвращает его ID (или None без БД)."""
     if not db_enabled() or _pool is None:
         return None
@@ -221,9 +237,11 @@ def insert_timer(chat_id, user_id, first_name, description, end_time):
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO timers "
-                    "(chat_id, user_id, user_first_name, description, end_time) "
-                    "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                    (chat_id, user_id, first_name, description, end_time),
+                    "(chat_id, user_id, user_first_name, description, end_time, "
+                    " is_recurring, interval_seconds) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (chat_id, user_id, first_name, description, end_time,
+                     is_recurring, interval_seconds),
                 )
                 return cur.fetchone()[0]
 
@@ -244,7 +262,10 @@ def delete_timer(timer_id):
 
 
 def load_all_timers():
-    """Возвращает все сохранённые таймеры: (id, chat_id, user_id, first_name, description, end_time)."""
+    """
+    Возвращает все сохранённые таймеры:
+    (id, chat_id, user_id, first_name, description, end_time, is_recurring, interval_seconds)
+    """
     if not db_enabled() or _pool is None:
         return []
 
@@ -252,12 +273,32 @@ def load_all_timers():
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, chat_id, user_id, user_first_name, description, end_time "
+                    "SELECT id, chat_id, user_id, user_first_name, description, "
+                    "       end_time, is_recurring, interval_seconds "
                     "FROM timers"
                 )
                 return cur.fetchall()
 
     return _run(_fn)
+
+
+def update_timer_end_time(timer_id: int, new_end_time: float):
+    """
+    Обновляет время следующего срабатывания таймера.
+    Используется повторяющимися таймерами вместо удаления.
+    """
+    if not db_enabled() or _pool is None:
+        return
+
+    def _fn(conn):
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE timers SET end_time = %s WHERE id = %s",
+                    (new_end_time, timer_id),
+                )
+
+    _run(_fn)
 
 
 # =============================================================================
