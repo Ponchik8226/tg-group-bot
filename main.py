@@ -385,7 +385,7 @@ def _build_timers_message(user_id: int, sort_mode: str) -> tuple:
 
     for info in snapshot:
         remaining = max(int(info["end_time"] - now), 0)
-        icon      = "🔁" if info["is_recurring"] else "⏱"
+        icon      = "🔁" if info["is_recurring"] else "•"
 
         header = f"{icon} <b>#{info['id']}</b> · {format_duration(remaining)}"
         if info["is_recurring"] and info["interval_seconds"]:
@@ -402,10 +402,10 @@ def _build_timers_message(user_id: int, sort_mode: str) -> tuple:
     # Inline-кнопки сортировки
     if sort_mode == "time":
         time_btn = types.InlineKeyboardButton("✅ По времени", callback_data="sort_timers:time")
-        id_btn   = types.InlineKeyboardButton("🔢 По ID",      callback_data="sort_timers:id")
+        id_btn   = types.InlineKeyboardButton("По номеру",     callback_data="sort_timers:id")
     else:
-        time_btn = types.InlineKeyboardButton("⏱ По времени", callback_data="sort_timers:time")
-        id_btn   = types.InlineKeyboardButton("✅ По ID",      callback_data="sort_timers:id")
+        time_btn = types.InlineKeyboardButton("По времени",    callback_data="sort_timers:time")
+        id_btn   = types.InlineKeyboardButton("✅ По номеру",  callback_data="sort_timers:id")
 
     markup = types.InlineKeyboardMarkup()
     markup.row(time_btn, id_btn)
