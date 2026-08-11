@@ -2,25 +2,20 @@
 Telegram-бот для личного использования в группе (pyTelegramBotAPI).
 
 Команды пользователей:
-/ping            — проверка отклика + аптайм
-/t, /т           — установка таймера
-/tr, /тр         — повторяющийся таймер (срабатывает снова и снова)
-/mytimers        — список своих таймеров (с сортировкой)
-/del, /cancel,
-"удалить", "отмена" — удаление таймера
-/start           — приветствие
-/help            — список команд
-/id              — ID чата, или ID пользователя/бота по реплаю
+/ping, /id, /start, /help
+/t, /т          — обычный таймер
+/tr, /тр        — повторяющийся таймер (с лимитом срабатываний)
+/mytimers       — список таймеров с сортировкой и обновлением
+/del, /cancel   — удалить таймер
+/к              — добавить reply-кнопку (видна только тебе)
+/ук             — удалить кнопку
 
 Архитектура:
 config.py   — объект bot, переменные окружения, логирование
-database.py — вся работа с БД (таймеры, статистика)
+database.py — вся работа с БД (таймеры, кнопки, статистика)
 utils.py    — мелкие хелперы
 admin.py    — все команды для администраторов
 main.py     — этот файл: пользовательские хендлеры, middleware, Flask, запуск
-
-ВАЖНО: для учёта статистики во всех чатах нужно отключить Privacy Mode
-бота через @BotFather (Bot Settings -> Group Privacy -> Turn off).
 """
 
 import html
@@ -45,26 +40,43 @@ from utils import (
 )
 
 # =============================================================================
+# КОНСТАНТЫ
+# =============================================================================
+
+MAX_TIMERS_PER_USER    = 100              # максимум активных таймеров на юзера
+MAX_TIMER_DURATION     = 365 * 24 * 3600  # максимальная длительность — 1 год
+MIN_TIMER_DURATION     = 10               # минимальная длительность — 10 сек
+MAX_DESCRIPTION_LENGTH = 200              # максимум символов в описании таймера
+
+MAX_USER_BUTTONS       = 10              # максимум reply-кнопок на юзера
+MAX_BUTTON_NAME_LENGTH = 50              # максимум символов в названии кнопки
+
+# Лимит для повторяющихся таймеров:
+# fires = min(365, 1_год // interval) → суммарный период ≤ 1 год
+_ONE_YEAR = 365 * 24 * 3600
+
+
+def _calc_max_fires(interval_seconds: int) -> int:
+    """Максимум срабатываний = 1 год суммарного периода, но не больше 365."""
+    return max(1, min(365, _ONE_YEAR // interval_seconds))
+
+
+# =============================================================================
 # ХРАНИЛИЩЕ АКТИВНЫХ ТАЙМЕРОВ (В ПАМЯТИ)
 # =============================================================================
 
 # TIMERS: timer_id -> {chat_id, user_id, user_mention, description, end_time,
-#                      duration, timer_obj, is_recurring, interval_seconds}
-TIMERS = {}
+#                      duration, timer_obj, is_recurring, interval_seconds,
+#                      fires_remaining}
+TIMERS: dict = {}
 
-# USER_TIMERS: user_id -> множество timer_id пользователя
-USER_TIMERS = {}
-
-# Лимиты таймеров
-MAX_TIMERS_PER_USER    = 100              # максимум активных таймеров
-MAX_TIMER_DURATION     = 365 * 24 * 3600  # максимальная длительность — 1 год
-MIN_TIMER_DURATION     = 10               # минимальная длительность — 10 секунд
-MAX_DESCRIPTION_LENGTH = 200              # максимальная длина описания
+# USER_TIMERS: user_id -> set of timer_id
+USER_TIMERS: dict = {}
 
 _next_timer_id = 1
 _timers_lock   = threading.Lock()
 
-# Текущий режим сортировки /mytimers по user_id: "id" или "time"
+# Текущий режим сортировки /mytimers: user_id -> "id" | "time"
 _sort_state: dict[int, str] = {}
 
 # =============================================================================
@@ -73,15 +85,13 @@ _sort_state: dict[int, str] = {}
 
 def fire_timer(timer_id: int, missed: bool = False):
     """
-    Срабатывает по таймеру: тегает пользователя и шлёт описание.
-    Если missed=True — таймер сработал, пока бот был выключен.
+    Срабатывает по таймеру.
 
-    Идемпотентен: если таймер уже удалён из TIMERS — просто выходим.
-
-    Повторяющийся таймер: вместо удаления из БД обновляет end_time
-    и создаёт новый threading.Timer на следующий цикл.
-
-    Порядок: сначала отправить, потом обновить/удалить из БД.
+    Идемпотентен — если таймер уже удалён, просто выходит.
+    Порядок: отправить сообщение → обновить/удалить в БД.
+    Повторяющийся: после отправки декрементирует счётчик.
+      - Если остались ещё срабатывания → обновляет end_time и рестартует.
+      - Если лимит исчерпан → удаляет из БД и уведомляет.
     """
     with _timers_lock:
         info = TIMERS.pop(timer_id, None)
@@ -89,18 +99,18 @@ def fire_timer(timer_id: int, missed: bool = False):
             USER_TIMERS.get(info["user_id"], set()).discard(timer_id)
 
     if info is None:
-        logger.info("Таймер #%s сработал, но был отменён ранее.", timer_id)
+        logger.info("Таймер #%s: уже был отменён, пропускаю.", timer_id)
         return
 
-    is_recurring    = info.get("is_recurring", False)
-    interval        = info.get("interval_seconds", 0)
+    is_recurring = info.get("is_recurring", False)
+    interval     = info.get("interval_seconds", 0)
 
     logger.info(
         "Таймер #%s сработал (chat_id=%s, user_id=%s, missed=%s, recurring=%s).",
         timer_id, info["chat_id"], info["user_id"], missed, is_recurring,
     )
 
-    # Текст уведомления
+    # ---------- Текст уведомления ----------
     if is_recurring:
         text = f"🔁 {info['user_mention']}, повторяющийся таймер!"
     else:
@@ -108,62 +118,69 @@ def fire_timer(timer_id: int, missed: bool = False):
 
     if info["description"]:
         text += f"\n📝 {html.escape(info['description'])}"
-    if is_recurring and interval:
-        text += f"\n↺ Следующий через {format_duration(interval)}"
     if missed:
         text += "\n\n⚠️ Бот был выключен, когда таймер должен был сработать."
 
-    # Отправка — 3 попытки
+    # ---------- Отправка — 3 попытки ----------
     for attempt in range(1, 4):
         try:
             bot.send_message(info["chat_id"], text)
             break
         except Exception:
             if attempt < 3:
-                logger.warning(
-                    "Попытка %d/3 отправить таймер #%s не удалась, повтор через 2 сек...",
-                    attempt, timer_id,
-                )
+                logger.warning("Попытка %d/3 отправить таймер #%s не удалась...", attempt, timer_id)
                 time.sleep(2)
             else:
-                logger.exception(
-                    "Не удалось отправить сообщение по таймеру #%s после 3 попыток.",
-                    timer_id,
-                )
+                logger.exception("Не удалось отправить таймер #%s после 3 попыток.", timer_id)
 
+    # ---------- Рестарт или завершение ----------
     if is_recurring and interval:
-        # Повторяющийся: обновляем время в БД и перезапускаем
-        new_end_time  = time.time() + interval
-        database.update_timer_end_time(timer_id, new_end_time)
+        new_remaining = database.decrement_timer_fires(timer_id)
+        # Если БД недоступна — считаем в памяти
+        if new_remaining is None:
+            new_remaining = max(0, info.get("fires_remaining", 0) - 1)
 
-        new_timer_obj = threading.Timer(interval, fire_timer, args=(timer_id,))
-        new_timer_obj.daemon = True
+        if new_remaining > 0:
+            # Продолжаем цикл
+            new_end_time  = time.time() + interval
+            database.update_timer_end_time(timer_id, new_end_time)
 
-        with _timers_lock:
-            TIMERS[timer_id] = {
-                **info,
-                "end_time":   new_end_time,
-                "duration":   interval,
-                "timer_obj":  new_timer_obj,
-            }
-            USER_TIMERS.setdefault(info["user_id"], set()).add(timer_id)
+            new_timer_obj = threading.Timer(interval, fire_timer, args=(timer_id,))
+            new_timer_obj.daemon = True
 
-        new_timer_obj.start()
-        logger.info(
-            "Повторяющийся таймер #%s перезапланирован через %s сек.",
-            timer_id, interval,
-        )
+            with _timers_lock:
+                TIMERS[timer_id] = {
+                    **info,
+                    "end_time":        new_end_time,
+                    "duration":        interval,
+                    "timer_obj":       new_timer_obj,
+                    "fires_remaining": new_remaining,
+                }
+                USER_TIMERS.setdefault(info["user_id"], set()).add(timer_id)
+
+            new_timer_obj.start()
+            logger.info("Повторяющийся таймер #%s перезапланирован, осталось %s раз.", timer_id, new_remaining)
+        else:
+            # Лимит исчерпан — удаляем
+            database.delete_timer(timer_id)
+            logger.info("Повторяющийся таймер #%s завершён: лимит срабатываний исчерпан.", timer_id)
+            try:
+                bot.send_message(
+                    info["chat_id"],
+                    f"🔁 {info['user_mention']}, повторяющийся таймер #{timer_id} завершён — "
+                    f"лимит срабатываний исчерпан.",
+                )
+            except Exception:
+                logger.exception("Не удалось отправить финальное сообщение таймера #%s.", timer_id)
     else:
-        # Обычный: удаляем из БД
         database.delete_timer(timer_id)
 
 
 def _check_due_timers():
-    """Проверяет TIMERS и срабатывает просроченные. Вызывается поллером."""
+    """Поллер: проверяет TIMERS и срабатывает просроченные."""
     now = time.time()
     with _timers_lock:
         due = [tid for tid, info in TIMERS.items() if info["end_time"] <= now]
-
     for tid in due:
         try:
             fire_timer(tid)
@@ -173,26 +190,20 @@ def _check_due_timers():
 
 def _start_timer_poller():
     """
-    Запускает фоновый поток-поллер — страховочная сеть для таймеров.
-
-    Основная точность обеспечивается threading.Timer (создаётся при
-    каждом новом таймере и при восстановлении из БД после рестарта).
-    Поллер нужен как запасной путь: если threading.Timer умер (рестарт
-    Render в середине длинного таймера), поллер подхватит через ≤30 сек.
-
-    Поскольку fire_timer идемпотентен, двойной вызов (Timer + поллер)
-    безопасен: второй просто найдёт пустое место и тихо выйдет.
+    Запускает поллер (каждые 30 сек) как страховочную сеть.
+    Основная точность — threading.Timer при создании/восстановлении.
+    Оба пути безопасны: fire_timer идемпотентен.
     """
-    def _poller():
-        logger.info("Планировщик таймеров запущен (интервал: 30 сек).")
+    def _loop():
+        logger.info("Поллер таймеров запущен (каждые 30 сек).")
         while True:
             time.sleep(30)
             try:
                 _check_due_timers()
             except Exception:
-                logger.exception("Ошибка в планировщике таймеров.")
+                logger.exception("Ошибка в поллере таймеров.")
 
-    threading.Thread(target=_poller, daemon=True, name="timer-poller").start()
+    threading.Thread(target=_loop, daemon=True, name="timer-poller").start()
 
 
 def create_timer(
@@ -201,14 +212,7 @@ def create_timer(
     description: str,
     is_recurring: bool = False,
 ):
-    """
-    Создаёт таймер: сохраняет в БД и добавляет в память.
-
-    Гибридный подход:
-    - threading.Timer  — срабатывает точно в нужное время
-    - поллер           — страховка на случай перезапуска бота
-    Оба пути безопасны: fire_timer идемпотентен.
-    """
+    """Создаёт таймер в БД и памяти."""
     global _next_timer_id
 
     user          = message.from_user
@@ -216,19 +220,21 @@ def create_timer(
     mention       = build_mention(user.id, first_name)
     end_time      = time.time() + duration_seconds
     interval_secs = duration_seconds if is_recurring else 0
+    fires_rem     = _calc_max_fires(duration_seconds) if is_recurring else 0
 
-    # ID из БД получаем ДО захвата лока (БД может быть медленной)
     if database.db_enabled():
         timer_id = database.insert_timer(
             message.chat.id, user.id, first_name, description, end_time,
-            is_recurring=is_recurring, interval_seconds=interval_secs,
+            is_recurring=is_recurring,
+            interval_seconds=interval_secs,
+            fires_remaining=fires_rem,
         )
     else:
         with _timers_lock:
             timer_id = _next_timer_id
             _next_timer_id += 1
 
-    # Создаём объект таймера, но не стартуем — чтобы не сработал
+    # Создаём Timer ДО захвата лока, стартуем ПОСЛЕ — чтобы не сработал
     # раньше, чем запись появится в TIMERS
     timer_obj = threading.Timer(duration_seconds, fire_timer, args=(timer_id,))
     timer_obj.daemon = True
@@ -244,13 +250,14 @@ def create_timer(
             "timer_obj":        timer_obj,
             "is_recurring":     is_recurring,
             "interval_seconds": interval_secs,
+            "fires_remaining":  fires_rem,
         }
         USER_TIMERS.setdefault(user.id, set()).add(timer_id)
 
     timer_obj.start()
 
     logger.info(
-        "Создан %s таймер #%s на %s сек (user_id=%s, chat_id=%s).",
+        "Создан %s таймер #%s, %s сек (user=%s, chat=%s).",
         "повторяющийся" if is_recurring else "обычный",
         timer_id, duration_seconds, user.id, message.chat.id,
     )
@@ -260,7 +267,8 @@ def create_timer(
         bot.reply_to(
             message,
             f"✅ Повторяющийся таймер #{timer_id} установлен.\n"
-            f"↺ Будет срабатывать каждые {format_duration(duration_seconds)}."
+            f"↺ Будет срабатывать каждые {format_duration(duration_seconds)}.\n"
+            f"📊 Максимум срабатываний: {fires_rem}"
             f"{desc_part}",
         )
     else:
@@ -276,28 +284,22 @@ def cancel_timer(timer_id: int, user_id: int) -> str:
     with _timers_lock:
         info = TIMERS.get(timer_id)
         if info is None:
-            return f"❌ Таймер #{timer_id} не найден (возможно, он уже сработал или удалён)."
+            return f"❌ Таймер #{timer_id} не найден (сработал или уже удалён)."
         if info["user_id"] != user_id:
             return f"❌ Таймер #{timer_id} принадлежит другому пользователю."
         del TIMERS[timer_id]
         USER_TIMERS.get(user_id, set()).discard(timer_id)
 
-    timer_obj = info.get("timer_obj")
-    if timer_obj is not None:
-        timer_obj.cancel()
-
+    t = info.get("timer_obj")
+    if t:
+        t.cancel()
     database.delete_timer(timer_id)
     logger.info("Таймер #%s отменён пользователем %s.", timer_id, user_id)
     return f"🗑 Таймер #{timer_id} успешно удалён."
 
 
 def restore_timers():
-    """
-    При старте восстанавливает таймеры из базы.
-
-    Просроченные — поллер подберёт через ≤30 сек.
-    Повторяющиеся просроченные — тоже подберёт и сразу перезапланирует.
-    """
+    """При старте восстанавливает таймеры из БД."""
     if not database.db_enabled():
         return
 
@@ -308,17 +310,16 @@ def restore_timers():
     now = time.time()
     restored = missed = 0
 
-    for (timer_id, chat_id, user_id, first_name,
-         description, end_time, is_recurring, interval_seconds) in rows:
+    for (timer_id, chat_id, user_id, first_name, description,
+         end_time, is_recurring, interval_seconds, fires_remaining) in rows:
 
         mention   = build_mention(user_id, first_name)
         remaining = end_time - now
 
+        timer_obj = None
         if remaining > 0:
             timer_obj = threading.Timer(remaining, fire_timer, args=(timer_id,))
             timer_obj.daemon = True
-        else:
-            timer_obj = None
 
         with _timers_lock:
             TIMERS[timer_id] = {
@@ -331,10 +332,11 @@ def restore_timers():
                 "timer_obj":        timer_obj,
                 "is_recurring":     bool(is_recurring),
                 "interval_seconds": int(interval_seconds),
+                "fires_remaining":  int(fires_remaining),
             }
             USER_TIMERS.setdefault(user_id, set()).add(timer_id)
 
-        if timer_obj is not None:
+        if timer_obj:
             timer_obj.start()
             restored += 1
         else:
@@ -347,13 +349,12 @@ def restore_timers():
 
 
 # =============================================================================
-# ОТОБРАЖЕНИЕ ТАЙМЕРОВ (/mytimers)
+# ОТОБРАЖЕНИЕ /mytimers
 # =============================================================================
 
 def _build_timers_message(user_id: int, sort_mode: str) -> tuple:
     """
-    Строит текст и inline-клавиатуру для /mytimers.
-    sort_mode: "id" — по порядку создания, "time" — сначала ближайшие.
+    Строит текст + inline-клавиатуру для /mytimers.
     Возвращает (text, markup). Если таймеров нет — markup=None.
     """
     now = time.time()
@@ -366,6 +367,7 @@ def _build_timers_message(user_id: int, sort_mode: str) -> tuple:
                 "description":      TIMERS[tid]["description"],
                 "is_recurring":     TIMERS[tid].get("is_recurring", False),
                 "interval_seconds": TIMERS[tid].get("interval_seconds", 0),
+                "fires_remaining":  TIMERS[tid].get("fires_remaining", 0),
             }
             for tid in USER_TIMERS.get(user_id, set())
             if tid in TIMERS
@@ -374,7 +376,6 @@ def _build_timers_message(user_id: int, sort_mode: str) -> tuple:
     if not snapshot:
         return "У вас нет активных таймеров.", None
 
-    # Сортировка
     if sort_mode == "time":
         snapshot.sort(key=lambda t: t["end_time"])
     else:
@@ -389,27 +390,29 @@ def _build_timers_message(user_id: int, sort_mode: str) -> tuple:
 
         header = f"{icon} <b>#{info['id']}</b> · {format_duration(remaining)}"
         if info["is_recurring"] and info["interval_seconds"]:
-            header += f"  <i>↺ каждые {format_duration(info['interval_seconds'])}</i>"
+            header += (
+                f"  <i>↺ каждые {format_duration(info['interval_seconds'])}"
+                f" · осталось {info['fires_remaining']} раз</i>"
+            )
         lines.append(header)
 
         if info["description"]:
             lines.append(html.escape(info["description"]))
-
-        lines.append("")  # пустая строка между таймерами
+        lines.append("")
 
     lines.append("/del [ID] — удалить таймер")
 
-    # Inline-кнопки сортировки
+    # Кнопки сортировки + обновление
     if sort_mode == "time":
-        time_btn = types.InlineKeyboardButton("✅ По времени", callback_data="sort_timers:time")
-        id_btn   = types.InlineKeyboardButton("По номеру",     callback_data="sort_timers:id")
+        time_btn    = types.InlineKeyboardButton("✅ По времени", callback_data="sort_timers:time")
+        id_btn      = types.InlineKeyboardButton("По номеру",    callback_data="sort_timers:id")
     else:
-        time_btn = types.InlineKeyboardButton("По времени",    callback_data="sort_timers:time")
-        id_btn   = types.InlineKeyboardButton("✅ По номеру",  callback_data="sort_timers:id")
+        time_btn    = types.InlineKeyboardButton("По времени",   callback_data="sort_timers:time")
+        id_btn      = types.InlineKeyboardButton("✅ По номеру", callback_data="sort_timers:id")
+    refresh_btn = types.InlineKeyboardButton("🔄",              callback_data="sort_timers:refresh")
 
     markup = types.InlineKeyboardMarkup()
-    markup.row(time_btn, id_btn)
-
+    markup.row(time_btn, id_btn, refresh_btn)
     return "\n".join(lines), markup
 
 
@@ -419,15 +422,12 @@ def _show_my_timers(message: types.Message):
     text, markup = _build_timers_message(user_id, sort_mode)
 
     if markup is None:
-        # Нет таймеров — без клавиатуры
         bot.reply_to(message, text)
         return
 
     if len(text) <= 4000:
-        # Обычный случай: одно сообщение с кнопками
         bot.reply_to(message, text, reply_markup=markup)
     else:
-        # Очень много таймеров / длинные описания — режем на части без кнопок
         chunks = split_message(text)
         for i, chunk in enumerate(chunks):
             if i == 0:
@@ -438,13 +438,17 @@ def _show_my_timers(message: types.Message):
 
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("sort_timers:"))
 def handle_sort_timers(call: types.CallbackQuery):
-    """Обрабатывает нажатия кнопок сортировки в /mytimers."""
-    sort_mode = call.data.split(":")[1]  # "time" или "id"
-    user_id   = call.from_user.id
-    _sort_state[user_id] = sort_mode
+    """Сортировка и обновление /mytimers через inline-кнопки."""
+    action  = call.data.split(":")[1]
+    user_id = call.from_user.id
+
+    if action == "refresh":
+        sort_mode = _sort_state.get(user_id, "id")
+    else:
+        sort_mode = action
+        _sort_state[user_id] = sort_mode
 
     text, markup = _build_timers_message(user_id, sort_mode)
-
     try:
         bot.edit_message_text(
             text,
@@ -454,36 +458,35 @@ def handle_sort_timers(call: types.CallbackQuery):
             parse_mode="HTML",
         )
     except Exception:
-        pass  # "message is not modified" — нормально, если список не изменился
+        pass  # "message is not modified" — нормально
 
     bot.answer_callback_query(call.id)
 
 
 # =============================================================================
-# ПАРСИНГ И ОБРАБОТКА КОМАНД ТАЙМЕРА
+# ПАРСИНГ КОМАНД ТАЙМЕРА
 # =============================================================================
 
 def _send_timer_usage_hint(message: types.Message):
     bot.reply_to(
         message,
-        "⚠️ Не удалось распознать команду таймера.\n\n"
+        "⚠️ Не удалось распознать команду.\n\n"
         "Формат: <code>/т [время] [описание]</code>\n"
-        "Время: буквы д/ч/м/с или d/h/m/s, например:\n"
-        "<code>/т 1д5ч30с проверить код</code>\n"
-        "<code>/т 10с</code> (описание не обязательно)\n"
-        f"Минимальное время — {MIN_TIMER_DURATION} сек, "
-        f"максимум описания — {MAX_DESCRIPTION_LENGTH} символов.",
+        "Время: д/ч/м/с или d/h/m/s, например:\n"
+        "  <code>/т 1д5ч30с купить продукты</code>\n"
+        "  <code>/т 10с</code>\n"
+        f"Минимум: {MIN_TIMER_DURATION} сек · Описание: до {MAX_DESCRIPTION_LENGTH} символов.",
     )
 
 
-def _send_recurring_timer_usage_hint(message: types.Message):
+def _send_recurring_usage_hint(message: types.Message):
     bot.reply_to(
         message,
         "⚠️ Не удалось распознать команду.\n\n"
         "Формат: <code>/тр [интервал] [описание]</code>\n"
         "Пример: <code>/тр 1д проверить почту</code>\n\n"
-        "Повторяющийся таймер срабатывает снова и снова с заданным "
-        "интервалом, пока не удалишь его через /del.",
+        "Таймер срабатывает снова и снова пока не удалишь через /del.\n"
+        "Суммарный период — не более 1 года.",
     )
 
 
@@ -494,20 +497,17 @@ def _validate_timer_args(
 ) -> int | None:
     """
     Проверяет время и описание. Возвращает duration_seconds или None
-    (и сам отвечает на message с причиной ошибки).
+    (сам отправляет сообщение с причиной ошибки).
     """
-    duration_seconds = parse_duration(time_part)
-    if duration_seconds is None:
+    duration = parse_duration(time_part)
+    if duration is None:
         return None
 
-    if duration_seconds < MIN_TIMER_DURATION:
-        bot.reply_to(
-            message,
-            f"⚠️ Минимальная длительность — {MIN_TIMER_DURATION} секунд.",
-        )
+    if duration < MIN_TIMER_DURATION:
+        bot.reply_to(message, f"⚠️ Минимальная длительность — {MIN_TIMER_DURATION} секунд.")
         return None
 
-    if duration_seconds > MAX_TIMER_DURATION:
+    if duration > MAX_TIMER_DURATION:
         bot.reply_to(message, "⚠️ Максимальная длительность — 1 год.")
         return None
 
@@ -515,7 +515,7 @@ def _validate_timer_args(
         bot.reply_to(
             message,
             f"⚠️ Описание слишком длинное ({len(description)} симв.). "
-            f"Максимум — {MAX_DESCRIPTION_LENGTH} символов. Сократите и попробуйте снова.",
+            f"Максимум — {MAX_DESCRIPTION_LENGTH} символов.",
         )
         return None
 
@@ -524,60 +524,50 @@ def _validate_timer_args(
     if count >= MAX_TIMERS_PER_USER:
         bot.reply_to(
             message,
-            f"⚠️ У вас уже {count} активных таймеров (максимум {MAX_TIMERS_PER_USER}). "
-            "Удалите старые через /mytimers.",
+            f"⚠️ У вас уже {count} таймеров (максимум {MAX_TIMERS_PER_USER}). "
+            "Удалите лишние через /mytimers.",
         )
         return None
 
-    return duration_seconds
+    return duration
 
 
 def _process_timer_request(message: types.Message, args_text: str):
-    """Разбирает аргументы и создаёт обычный таймер."""
     args_text = args_text.strip()
     if not args_text:
         _send_timer_usage_hint(message)
         return
-
     parts       = args_text.split(maxsplit=1)
-    time_part   = parts[0]
     description = parts[1].strip() if len(parts) > 1 else ""
-
-    duration = _validate_timer_args(message, time_part, description)
+    duration    = _validate_timer_args(message, parts[0], description)
     if duration is None:
-        if parse_duration(time_part) is None:
+        if parse_duration(parts[0]) is None:
             _send_timer_usage_hint(message)
         return
-
     create_timer(message, duration, description, is_recurring=False)
 
 
-def _process_recurring_timer_request(message: types.Message, args_text: str):
-    """Разбирает аргументы и создаёт повторяющийся таймер."""
+def _process_recurring_request(message: types.Message, args_text: str):
     args_text = args_text.strip()
     if not args_text:
-        _send_recurring_timer_usage_hint(message)
+        _send_recurring_usage_hint(message)
         return
-
     parts       = args_text.split(maxsplit=1)
-    time_part   = parts[0]
     description = parts[1].strip() if len(parts) > 1 else ""
-
-    duration = _validate_timer_args(message, time_part, description)
+    duration    = _validate_timer_args(message, parts[0], description)
     if duration is None:
-        if parse_duration(time_part) is None:
-            _send_recurring_timer_usage_hint(message)
+        if parse_duration(parts[0]) is None:
+            _send_recurring_usage_hint(message)
         return
-
     create_timer(message, duration, description, is_recurring=True)
 
 
 def _send_cancel_usage_hint(message: types.Message):
     bot.reply_to(
         message,
-        "⚠️ Укажите ID таймера для удаления.\n"
-        "Формат: <code>/del [ID]</code> или <code>удалить [ID]</code>\n"
-        "Посмотреть ID — /mytimers.",
+        "⚠️ Укажите ID таймера.\n"
+        "Формат: <code>/del [ID]</code>\n"
+        "Список ID — /mytimers.",
     )
 
 
@@ -586,21 +576,172 @@ def _process_cancel_request(message: types.Message, args_text: str):
     if not args_text:
         _send_cancel_usage_hint(message)
         return
-
-    timer_id_str = args_text.split(maxsplit=1)[0].lstrip("#")
-    if not timer_id_str.isdigit():
+    id_str = args_text.split()[0].lstrip("#")
+    if not id_str.isdigit():
         _send_cancel_usage_hint(message)
         return
-
-    bot.reply_to(message, cancel_timer(int(timer_id_str), message.from_user.id))
+    bot.reply_to(message, cancel_timer(int(id_str), message.from_user.id))
 
 
 # =============================================================================
-# СТАТИСТИКА: УЧЁТ И ОТЧЁТ
+# ПОЛЬЗОВАТЕЛЬСКИЕ REPLY-КНОПКИ (/к, /ук)
+# =============================================================================
+
+def _build_user_keyboard(buttons: list):
+    """
+    Строит ReplyKeyboardMarkup из кнопок (2 в ряд, selective=True).
+    Если кнопок нет — возвращает ReplyKeyboardRemove.
+    """
+    if not buttons:
+        return types.ReplyKeyboardRemove(selective=True)
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
+    row    = []
+    for _, name in buttons:
+        row.append(types.KeyboardButton(name))
+        if len(row) == 2:
+            markup.row(*row)
+            row = []
+    if row:
+        markup.row(*row)
+    return markup
+
+
+def _process_add_button(message: types.Message, name: str):
+    name    = name.strip()
+    user_id = message.from_user.id
+
+    if not name:
+        bot.reply_to(
+            message,
+            "⚠️ Укажите название кнопки.\n"
+            "Пример: <code>/к Проверить почту</code>",
+        )
+        return
+
+    if len(name) > MAX_BUTTON_NAME_LENGTH:
+        bot.reply_to(
+            message,
+            f"⚠️ Название слишком длинное ({len(name)} симв.). "
+            f"Максимум — {MAX_BUTTON_NAME_LENGTH} символов.",
+        )
+        return
+
+    buttons = database.get_user_buttons(user_id)
+
+    if len(buttons) >= MAX_USER_BUTTONS:
+        bot.reply_to(
+            message,
+            f"⚠️ У вас уже {MAX_USER_BUTTONS} кнопок (максимум). "
+            "Удалите лишние через /ук.",
+        )
+        return
+
+    # Проверка дубликата (без учёта регистра)
+    if any(n.lower() == name.lower() for _, n in buttons):
+        bot.reply_to(
+            message,
+            f"⚠️ Кнопка «{html.escape(name)}» уже есть.",
+        )
+        return
+
+    result = database.add_user_button(user_id, name)
+    if result is None:
+        bot.reply_to(message, "❌ Не удалось добавить кнопку. Попробуйте ещё раз.")
+        return
+
+    buttons = database.get_user_buttons(user_id)
+    bot.reply_to(
+        message,
+        f"✅ Кнопка «{html.escape(name)}» добавлена.",
+        reply_markup=_build_user_keyboard(buttons),
+    )
+
+
+def _process_remove_button(message: types.Message, identifier: str):
+    identifier = identifier.strip()
+    user_id    = message.from_user.id
+
+    if not identifier:
+        bot.reply_to(
+            message,
+            "⚠️ Укажите номер или название кнопки.\n"
+            "Пример: <code>/ук 1</code> или <code>/ук Проверить почту</code>\n"
+            "Список кнопок — /к без аргументов.",
+        )
+        return
+
+    buttons = database.get_user_buttons(user_id)
+
+    if not buttons:
+        bot.reply_to(message, "У вас нет кнопок.")
+        return
+
+    button_id = button_name = None
+
+    if identifier.isdigit():
+        idx = int(identifier) - 1  # 1-индексированный
+        if 0 <= idx < len(buttons):
+            button_id, button_name = buttons[idx]
+        else:
+            bot.reply_to(
+                message,
+                f"⚠️ Нет кнопки #{identifier}. У вас {len(buttons)} кнопок.",
+            )
+            return
+    else:
+        for bid, bname in buttons:
+            if bname.lower() == identifier.lower():
+                button_id, button_name = bid, bname
+                break
+        if button_id is None:
+            bot.reply_to(
+                message,
+                f"⚠️ Кнопка «{html.escape(identifier)}» не найдена.",
+            )
+            return
+
+    database.remove_user_button(button_id, user_id)
+    remaining = database.get_user_buttons(user_id)
+
+    suffix = "\nВсе кнопки удалены." if not remaining else ""
+    bot.reply_to(
+        message,
+        f"🗑 Кнопка «{html.escape(button_name)}» удалена.{suffix}",
+        reply_markup=_build_user_keyboard(remaining),
+    )
+
+
+# /к без аргументов — показать список кнопок
+def _show_user_buttons(message: types.Message):
+    user_id = message.from_user.id
+    buttons = database.get_user_buttons(user_id)
+
+    if not buttons:
+        bot.reply_to(
+            message,
+            "У вас нет кнопок.\n"
+            "Добавьте: <code>/к [название]</code>",
+        )
+        return
+
+    lines = [f"<b>📌 Ваши кнопки ({len(buttons)})</b>", ""]
+    for i, (_, name) in enumerate(buttons, 1):
+        lines.append(f"{i}. {html.escape(name)}")
+    lines.append("\nДля удаления: <code>/ук [номер или название]</code>")
+
+    bot.reply_to(
+        message,
+        "\n".join(lines),
+        reply_markup=_build_user_keyboard(buttons),
+    )
+
+
+# =============================================================================
+# СТАТИСТИКА: УЧЁТ СООБЩЕНИЙ
 # =============================================================================
 
 def track_message_stats(message: types.Message):
-    """Извлекает данные из сообщения и передаёт их в database.record_message_stats."""
     if not database.db_enabled():
         return
 
@@ -609,14 +750,15 @@ def track_message_stats(message: types.Message):
         return
 
     chat = message.chat
-    if chat.type == "private":
-        chat_title = f"ЛС: {user.first_name or user.username or user.id}"
-    else:
-        chat_title = chat.title or str(chat.id)
+    chat_title = (
+        f"ЛС: {user.first_name or user.username or user.id}"
+        if chat.type == "private"
+        else (chat.title or str(chat.id))
+    )
 
     is_forward = (
-        message.forward_origin      is not None
-        or message.forward_from     is not None
+        message.forward_origin       is not None
+        or message.forward_from      is not None
         or message.forward_from_chat is not None
         or message.forward_sender_name is not None
     )
@@ -631,28 +773,17 @@ def track_message_stats(message: types.Message):
         )
         return
 
-    content_type = message.content_type
-    is_sticker   = content_type == "sticker"
-    messages     = 0 if is_sticker else 1
+    ct       = message.content_type
+    messages = 0 if ct == "sticker" else 1
     chars = stickers = photos = videos = voice = gifs = 0
 
-    if content_type == "text":
-        chars = len(message.text or "")
-    elif content_type == "sticker":
-        stickers = 1
-    elif content_type == "photo":
-        photos = 1
-        chars  = len(message.caption or "")
-    elif content_type == "video":
-        videos = 1
-        chars  = len(message.caption or "")
-    elif content_type in ("voice", "video_note"):
-        voice = 1
-    elif content_type == "animation":
-        gifs  = 1
-        chars = len(message.caption or "")
-    elif message.caption:
-        chars = len(message.caption)
+    if ct == "text":           chars    = len(message.text or "")
+    elif ct == "sticker":      stickers = 1
+    elif ct == "photo":        photos   = 1; chars = len(message.caption or "")
+    elif ct == "video":        videos   = 1; chars = len(message.caption or "")
+    elif ct in ("voice","video_note"): voice = 1
+    elif ct == "animation":    gifs     = 1; chars = len(message.caption or "")
+    elif message.caption:      chars    = len(message.caption)
 
     database.record_message_stats(
         user_id=user.id, username=user.username,
@@ -663,68 +794,140 @@ def track_message_stats(message: types.Message):
     )
 
 
-# =============================================================================
-# MIDDLEWARE: УЧЁТ СТАТИСТИКИ
-# =============================================================================
-
 @bot.middleware_handler(update_types=["message"])
 def stats_middleware(bot_instance, message):
-    """
-    Срабатывает на каждое сообщение во всех чатах.
-    Запись в БД — в отдельном потоке, чтобы не задерживать ответ бота.
-    """
-    def _track():
-        try:
-            track_message_stats(message)
-        except Exception:
-            logger.exception("Ошибка при записи статистики сообщения.")
+    threading.Thread(
+        target=lambda: _safe_track(message), daemon=True
+    ).start()
 
-    threading.Thread(target=_track, daemon=True).start()
+
+def _safe_track(message):
+    try:
+        track_message_stats(message)
+    except Exception:
+        logger.exception("Ошибка при записи статистики сообщения.")
+
+
+# =============================================================================
+# ИНТЕРАКТИВНЫЙ /help
+# =============================================================================
+
+_HELP_MAIN = (
+    "🤖 <b>Привет! Я бот для напоминаний.</b>\n\n"
+    "Выбери раздел чтобы узнать о командах:"
+)
+
+_HELP_TIMERS = (
+    "⏰ <b>Таймеры</b>\n\n"
+
+    "<b>Обычный таймер</b>\n"
+    "<code>/т [время] [описание]</code>  ·  <code>/t [время] [описание]</code>\n"
+    "Время задаётся буквами <code>д/ч/м/с</code> или <code>d/h/m/s</code>.\n"
+    f"Минимум: {MIN_TIMER_DURATION} сек · Описание: до {MAX_DESCRIPTION_LENGTH} символов.\n"
+    "Примеры:\n"
+    "  <code>/т 1д5ч30с купить продукты</code>\n"
+    "  <code>/t 2h30m buy groceries</code>\n\n"
+
+    "<b>Повторяющийся таймер</b>\n"
+    "<code>/тр [интервал] [описание]</code>  ·  <code>/tr [интервал] [описание]</code>\n"
+    "Срабатывает снова и снова с заданным интервалом.\n"
+    "Автоматически завершается (суммарный период — не более 1 года).\n"
+    "Пример: <code>/тр 1д проверить почту</code>\n\n"
+
+    "<b>Мои таймеры</b>\n"
+    "<code>/mytimers</code>\n"
+    "Список с кнопками сортировки (по времени / по номеру) и обновления.\n\n"
+
+    "<b>Удалить таймер</b>\n"
+    "<code>/del [ID]</code>\n"
+    "Синонимы: <code>/cancel</code>, <code>удалить</code>, <code>отмена</code>\n"
+    "Пример: <code>/del 3</code>"
+)
+
+_HELP_BUTTONS = (
+    "📌 <b>Быстрые кнопки</b>\n\n"
+    "Создай свои кнопки в панели ввода — они видны только тебе.\n\n"
+
+    "<b>Добавить кнопку</b>\n"
+    "<code>/к [название]</code>\n"
+    "Пример: <code>/к Проверить почту</code>\n\n"
+
+    "<b>Удалить кнопку</b>\n"
+    "<code>/ук [номер или название]</code>\n"
+    "Пример: <code>/ук 1</code>  или  <code>/ук Проверить почту</code>\n\n"
+
+    "<b>Посмотреть список кнопок</b>\n"
+    "<code>/к</code> (без аргументов)\n\n"
+
+    f"Максимум кнопок: {MAX_USER_BUTTONS} · Название: до {MAX_BUTTON_NAME_LENGTH} символов."
+)
+
+_HELP_MISC = (
+    "💡 <b>Прочее</b>\n\n"
+
+    "🏓 <code>/ping</code>\n"
+    "Проверка отклика и аптайм бота.\n\n"
+
+    "🆔 <code>/id</code>\n"
+    "В чате — ID чата.\n"
+    "Реплаем на сообщение — ID пользователя или бота.\n"
+    "В личке — ваш Telegram ID."
+)
+
+
+def _help_markup_main() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup()
+    m.row(
+        types.InlineKeyboardButton("⏰ Таймеры", callback_data="help:timers"),
+        types.InlineKeyboardButton("📌 Кнопки",  callback_data="help:buttons"),
+        types.InlineKeyboardButton("💡 Прочее",  callback_data="help:misc"),
+    )
+    return m
+
+
+def _help_markup_back() -> types.InlineKeyboardMarkup:
+    m = types.InlineKeyboardMarkup()
+    m.row(types.InlineKeyboardButton("← Назад", callback_data="help:main"))
+    return m
+
+
+_HELP_SECTIONS = {
+    "main":    (_HELP_MAIN,    _help_markup_main),
+    "timers":  (_HELP_TIMERS,  _help_markup_back),
+    "buttons": (_HELP_BUTTONS, _help_markup_back),
+    "misc":    (_HELP_MISC,    _help_markup_back),
+}
+
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("help:"))
+def handle_help_callback(call: types.CallbackQuery):
+    section = call.data.split(":")[1]
+    if section not in _HELP_SECTIONS:
+        bot.answer_callback_query(call.id)
+        return
+
+    text, markup_fn = _HELP_SECTIONS[section]
+    try:
+        bot.edit_message_text(
+            text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=markup_fn(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id)
 
 
 # =============================================================================
 # ОБРАБОТЧИКИ КОМАНД
 # =============================================================================
 
-_BOT_USERNAME = ""  # заполняется при старте через bot.get_me()
-
-HELP_TEXT = (
-    "<b>🤖 Команды бота</b>\n\n"
-
-    "<b>⏱ Обычный таймер</b>\n"
-    "<code>/t [время] [описание]</code>  или  <code>/т [время] [описание]</code>\n"
-    "Время: <code>д/ч/м/с</code> или <code>d/h/m/s</code>, можно комбинировать.\n"
-    f"Мин. {MIN_TIMER_DURATION} сек · Макс. описание {MAX_DESCRIPTION_LENGTH} симв.\n"
-    "Примеры:\n"
-    "  <code>/т 1д5ч30с купить продукты</code>\n"
-    "  <code>/t 2h30m buy groceries</code>\n\n"
-
-    "<b>🔁 Повторяющийся таймер</b>\n"
-    "<code>/tr [интервал] [описание]</code>  или  <code>/тр [интервал] [описание]</code>\n"
-    "Срабатывает снова и снова с заданным интервалом до тех пор, "
-    "пока не удалишь через /del.\n"
-    "Пример:\n"
-    "  <code>/тр 1д проверить почту</code>\n\n"
-
-    "<b>📑 Мои таймеры</b>\n"
-    "<code>/mytimers</code>\n"
-    "Список с остатком времени. Кнопки внизу — сортировка по времени или по ID.\n\n"
-
-    "<b>🗑 Удалить таймер</b>\n"
-    "<code>/del [ID]</code>\n"
-    "Синонимы: <code>/cancel</code>, <code>удалить</code>, <code>отмена</code>\n"
-    "Пример: <code>/del 3</code>\n\n"
-
-    "🏓 <code>/ping</code> — отклик + аптайм\n\n"
-
-    "🆔 <code>/id</code>\n"
-    "В чате — ID чата. Реплаем на сообщение — ID пользователя/бота. "
-    "В личке — ваш ID.\n\n"
-)
+_BOT_USERNAME = ""
 
 
 def _is_for_me(message: types.Message) -> bool:
-    """Команда адресована нашему боту (или без @mention в группе)."""
     text = message.text or ""
     if "@" not in text:
         return True
@@ -746,79 +949,60 @@ def handle_start(message: types.Message):
 def handle_help(message: types.Message):
     if not _is_for_me(message):
         return
-    bot.reply_to(message, HELP_TEXT)
+    bot.reply_to(message, _HELP_MAIN, reply_markup=_help_markup_main())
 
 
 @bot.message_handler(commands=["id"])
 def handle_id(message: types.Message):
-    """
-    Без реплая в группе  — ID чата.
-    Без реплая в личке   — Telegram ID пользователя.
-    С реплаем            — ID того, на кого ответили.
-    """
     if message.reply_to_message:
-        target    = message.reply_to_message.from_user
-        name      = html.escape(target.first_name or target.username or str(target.id))
-        bot_label = " (бот)" if target.is_bot else ""
-        bot.reply_to(
-            message,
-            f"🆔 ID <b>{name}</b>{bot_label}: <code>{target.id}</code>",
-        )
+        t         = message.reply_to_message.from_user
+        name      = html.escape(t.first_name or t.username or str(t.id))
+        bot_label = " (бот)" if t.is_bot else ""
+        bot.reply_to(message, f"🆔 ID <b>{name}</b>{bot_label}: <code>{t.id}</code>")
     elif message.chat.type == "private":
-        bot.reply_to(
-            message,
-            f"🆔 Ваш Telegram ID: <code>{message.from_user.id}</code>",
-        )
+        bot.reply_to(message, f"🆔 Ваш Telegram ID: <code>{message.from_user.id}</code>")
     else:
-        bot.reply_to(
-            message,
-            f"🆔 ID этого чата: <code>{message.chat.id}</code>",
-        )
+        bot.reply_to(message, f"🆔 ID этого чата: <code>{message.chat.id}</code>")
 
 
 @bot.message_handler(commands=["ping"])
 def handle_ping(message: types.Message):
-    """Round-trip до Telegram API + аптайм."""
     start = time.perf_counter()
     sent  = bot.send_message(message.chat.id, "🏓 Pong!")
     ms    = (time.perf_counter() - start) * 1000
     bot.edit_message_text(
         chat_id=message.chat.id,
         message_id=sent.message_id,
-        text=(
-            f"🏓 Pong!\n"
-            f"Ping: <code>{ms:.3f}</code> ms\n"
-            f"Uptime: {get_uptime_str()}"
-        ),
+        text=f"🏓 Pong!\nPing: <code>{ms:.3f}</code> ms\nUptime: {get_uptime_str()}",
     )
 
 
 @bot.message_handler(commands=["t", "т"])
-def handle_timer_slash(message: types.Message):
+def handle_timer(message: types.Message):
     parts = message.text.split(maxsplit=1)
     _process_timer_request(message, parts[1] if len(parts) > 1 else "")
 
 
 @bot.message_handler(commands=["tr", "тр"])
-def handle_recurring_timer_slash(message: types.Message):
+def handle_recurring_timer(message: types.Message):
     parts = message.text.split(maxsplit=1)
-    _process_recurring_timer_request(message, parts[1] if len(parts) > 1 else "")
+    _process_recurring_request(message, parts[1] if len(parts) > 1 else "")
 
 
 @bot.message_handler(commands=["mytimers"])
-def handle_my_timers_command(message: types.Message):
+def handle_mytimers(message: types.Message):
     _show_my_timers(message)
 
 
 @bot.message_handler(
     func=lambda m: bool(re.match(r"^таймеры\b", (m.text or ""), re.IGNORECASE))
 )
-def handle_my_timers_text(message: types.Message):
+def handle_mytimers_text(message: types.Message):
     _show_my_timers(message)
 
 
 @bot.message_handler(commands=["del", "del_timer", "cancel"])
-def handle_cancel_slash(message: types.Message):
+def handle_cancel(message: types.Message):
     parts = message.text.split(maxsplit=1)
     _process_cancel_request(message, parts[1] if len(parts) > 1 else "")
 
@@ -831,8 +1015,23 @@ def handle_cancel_text(message: types.Message):
     _process_cancel_request(message, parts[1] if len(parts) > 1 else "")
 
 
+@bot.message_handler(commands=["к"])
+def handle_add_button(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1:
+        _process_add_button(message, parts[1])
+    else:
+        _show_user_buttons(message)
+
+
+@bot.message_handler(commands=["ук"])
+def handle_remove_button(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    _process_remove_button(message, parts[1] if len(parts) > 1 else "")
+
+
 # =============================================================================
-# ВЕБ-СЕРВЕР (WEBHOOK + HEALTHCHECK)
+# ВЕБ-СЕРВЕР
 # =============================================================================
 
 web_app = Flask(__name__)
@@ -840,13 +1039,11 @@ web_app = Flask(__name__)
 
 @web_app.route("/")
 def health_check():
-    """UptimeRobot пингует сюда каждые 5 мин, чтобы Render не засыпал."""
     return "Bot is running!"
 
 
 @web_app.route("/webhook", methods=["POST"])
 def webhook():
-    """Telegram присылает сюда обновления (сообщения, callback_query и т.д.)."""
     if flask_request.headers.get("content-type") == "application/json":
         update = types.Update.de_json(flask_request.get_data(as_text=True))
         bot.process_new_updates([update])
@@ -855,7 +1052,7 @@ def webhook():
 
 
 # =============================================================================
-# ТОЧКА ВХОДА / ЗАПУСК БОТА
+# ТОЧКА ВХОДА
 # =============================================================================
 
 def main():
@@ -873,15 +1070,13 @@ def main():
     database.init_db()
     restore_timers()
     _start_timer_poller()
-
     admin.register(_BOT_USERNAME)
 
     webhook_url = os.environ.get("WEBHOOK_URL", "").rstrip("/")
     if not webhook_url:
-        logger.warning("WEBHOOK_URL не задан — запускаю polling (только локально).")
+        logger.warning("WEBHOOK_URL не задан — polling (только локально).")
         while True:
             try:
-                logger.info("Запуск polling...")
                 bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
             except Exception:
                 logger.exception("Polling упал, перезапуск через 5 сек...")
@@ -898,7 +1093,7 @@ def main():
     logger.info("Webhook: %s/webhook", webhook_url)
 
     port = int(os.environ.get("PORT", 10000))
-    logger.info("Flask на порту %s...", port)
+    logger.info("Flask на порту %s", port)
     web_app.run(host="0.0.0.0", port=port, threaded=True)
 
 

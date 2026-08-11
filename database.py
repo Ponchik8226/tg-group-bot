@@ -216,6 +216,25 @@ def init_db():
                     ADD COLUMN IF NOT EXISTS interval_seconds BIGINT NOT NULL DEFAULT 0
                     """
                 )
+                # Счётчик оставшихся срабатываний для повторяющихся таймеров (v3)
+                cur.execute(
+                    """
+                    ALTER TABLE timers
+                    ADD COLUMN IF NOT EXISTS fires_remaining INT NOT NULL DEFAULT 0
+                    """
+                )
+                # Пользовательские reply-кнопки (v3)
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_buttons (
+                        id          SERIAL PRIMARY KEY,
+                        user_id     BIGINT NOT NULL,
+                        name        TEXT NOT NULL,
+                        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        UNIQUE (user_id, name)
+                    )
+                    """
+                )
 
     _run(_fn)
 
@@ -227,6 +246,7 @@ def init_db():
 def insert_timer(
     chat_id, user_id, first_name, description, end_time,
     is_recurring: bool = False, interval_seconds: int = 0,
+    fires_remaining: int = 0,
 ):
     """Сохраняет таймер в базу и возвращает его ID (или None без БД)."""
     if not db_enabled() or _pool is None:
@@ -238,10 +258,10 @@ def insert_timer(
                 cur.execute(
                     "INSERT INTO timers "
                     "(chat_id, user_id, user_first_name, description, end_time, "
-                    " is_recurring, interval_seconds) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    " is_recurring, interval_seconds, fires_remaining) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                     (chat_id, user_id, first_name, description, end_time,
-                     is_recurring, interval_seconds),
+                     is_recurring, interval_seconds, fires_remaining),
                 )
                 return cur.fetchone()[0]
 
@@ -264,7 +284,8 @@ def delete_timer(timer_id):
 def load_all_timers():
     """
     Возвращает все сохранённые таймеры:
-    (id, chat_id, user_id, first_name, description, end_time, is_recurring, interval_seconds)
+    (id, chat_id, user_id, first_name, description, end_time,
+     is_recurring, interval_seconds, fires_remaining)
     """
     if not db_enabled() or _pool is None:
         return []
@@ -274,10 +295,32 @@ def load_all_timers():
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, chat_id, user_id, user_first_name, description, "
-                    "       end_time, is_recurring, interval_seconds "
+                    "       end_time, is_recurring, interval_seconds, fires_remaining "
                     "FROM timers"
                 )
                 return cur.fetchall()
+
+    return _run(_fn)
+
+
+def decrement_timer_fires(timer_id: int) -> int:
+    """
+    Атомарно уменьшает fires_remaining на 1.
+    Возвращает новое значение (0 = лимит исчерпан).
+    """
+    if not db_enabled() or _pool is None:
+        return 0
+
+    def _fn(conn):
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE timers SET fires_remaining = fires_remaining - 1 "
+                    "WHERE id = %s RETURNING fires_remaining",
+                    (timer_id,),
+                )
+                row = cur.fetchone()
+                return row[0] if row else 0
 
     return _run(_fn)
 
@@ -299,6 +342,71 @@ def update_timer_end_time(timer_id: int, new_end_time: float):
                 )
 
     _run(_fn)
+
+
+# =============================================================================
+# ПОЛЬЗОВАТЕЛЬСКИЕ КНОПКИ
+# =============================================================================
+
+def get_user_buttons(user_id: int) -> list:
+    """
+    Возвращает кнопки пользователя: [(id, name), ...], отсортированы по id.
+    """
+    if not db_enabled() or _pool is None:
+        return []
+
+    def _fn(conn):
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, name FROM user_buttons "
+                    "WHERE user_id = %s ORDER BY id",
+                    (user_id,),
+                )
+                return cur.fetchall()
+
+    return _run(_fn)
+
+
+def add_user_button(user_id: int, name: str) -> int | None:
+    """
+    Добавляет кнопку пользователю. Возвращает id новой кнопки или None
+    если кнопка с таким названием уже есть (UNIQUE constraint).
+    """
+    if not db_enabled() or _pool is None:
+        return None
+
+    def _fn(conn):
+        with conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "INSERT INTO user_buttons (user_id, name) "
+                        "VALUES (%s, %s) RETURNING id",
+                        (user_id, name),
+                    )
+                    return cur.fetchone()[0]
+                except Exception:
+                    return None  # дубликат
+
+    return _run(_fn)
+
+
+def remove_user_button(button_id: int, user_id: int) -> bool:
+    """Удаляет кнопку по id. Возвращает True если удалена."""
+    if not db_enabled() or _pool is None:
+        return False
+
+    def _fn(conn):
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM user_buttons WHERE id = %s AND user_id = %s",
+                    (button_id, user_id),
+                )
+                return cur.rowcount > 0
+
+    return _run(_fn)
 
 
 # =============================================================================
