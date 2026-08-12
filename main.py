@@ -48,7 +48,7 @@ MAX_TIMER_DURATION     = 365 * 24 * 3600  # максимальная длите�
 MIN_TIMER_DURATION     = 10               # минимальная длительность — 10 сек
 MAX_DESCRIPTION_LENGTH = 200              # максимум символов в описании таймера
 
-MAX_USER_BUTTONS       = 10              # максимум reply-кнопок на юзера
+MAX_USER_BUTTONS       = 20              # максимум reply-кнопок на юзера
 MAX_BUTTON_NAME_LENGTH = 50              # максимум символов в названии кнопки
 
 # Лимит для повторяющихся таймеров:
@@ -404,15 +404,16 @@ def _build_timers_message(user_id: int, sort_mode: str) -> tuple:
 
     # Кнопки сортировки + обновление
     if sort_mode == "time":
-        time_btn    = types.InlineKeyboardButton("✅ По времени", callback_data="sort_timers:time")
-        id_btn      = types.InlineKeyboardButton("По номеру",    callback_data="sort_timers:id")
+        time_btn = types.InlineKeyboardButton("✅ По времени", callback_data="sort_timers:time")
+        id_btn   = types.InlineKeyboardButton("По номеру",    callback_data="sort_timers:id")
     else:
-        time_btn    = types.InlineKeyboardButton("По времени",   callback_data="sort_timers:time")
-        id_btn      = types.InlineKeyboardButton("✅ По номеру", callback_data="sort_timers:id")
-    refresh_btn = types.InlineKeyboardButton("🔄",              callback_data="sort_timers:refresh")
+        time_btn = types.InlineKeyboardButton("По времени",   callback_data="sort_timers:time")
+        id_btn   = types.InlineKeyboardButton("✅ По номеру", callback_data="sort_timers:id")
+    refresh_btn = types.InlineKeyboardButton("🔄 Обновить",  callback_data="sort_timers:refresh")
 
     markup = types.InlineKeyboardMarkup()
-    markup.row(time_btn, id_btn, refresh_btn)
+    markup.row(time_btn, id_btn)
+    markup.row(refresh_btn)
     return "\n".join(lines), markup
 
 
@@ -584,22 +585,24 @@ def _process_cancel_request(message: types.Message, args_text: str):
 
 
 # =============================================================================
-# ПОЛЬЗОВАТЕЛЬСКИЕ REPLY-КНОПКИ (/к, /ук)
+# ПОЛЬЗОВАТЕЛЬСКИЕ REPLY-КНОПКИ (/к, /ук, /кнопки)
 # =============================================================================
 
 def _build_user_keyboard(buttons: list):
     """
-    Строит ReplyKeyboardMarkup из кнопок (2 в ряд, selective=True).
-    Если кнопок нет — возвращает ReplyKeyboardRemove.
+    Строит ReplyKeyboardMarkup из активных кнопок (3 в ряд, selective=True).
+    buttons: [(id, name, is_active), ...]
+    Если активных кнопок нет — возвращает ReplyKeyboardRemove.
     """
-    if not buttons:
+    active = [name for _, name, is_active in buttons if is_active]
+    if not active:
         return types.ReplyKeyboardRemove(selective=True)
 
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
-    row    = []
-    for _, name in buttons:
+    row = []
+    for name in active:
         row.append(types.KeyboardButton(name))
-        if len(row) == 2:
+        if len(row) == 3:
             markup.row(*row)
             row = []
     if row:
@@ -607,67 +610,131 @@ def _build_user_keyboard(buttons: list):
     return markup
 
 
-def _process_add_button(message: types.Message, name: str):
-    name    = name.strip()
-    user_id = message.from_user.id
+def _parse_button_names(raw: str) -> list[str]:
+    """
+    Парсит строку с названиями кнопок.
+    Приоритет: разделитель ";" → перенос строки → вся строка целиком.
+    Возвращает список непустых уникальных названий (порядок сохраняется).
+    """
+    if ";" in raw:
+        parts = raw.split(";")
+    elif "\n" in raw:
+        parts = raw.split("\n")
+    else:
+        parts = [raw]
 
-    if not name:
-        bot.reply_to(
-            message,
-            "⚠️ Укажите название кнопки.\n"
-            "Пример: <code>/к Проверить почту</code>",
-        )
-        return
+    seen = set()
+    result = []
+    for p in parts:
+        name = p.strip()
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            result.append(name)
+    return result
 
-    if len(name) > MAX_BUTTON_NAME_LENGTH:
-        bot.reply_to(
-            message,
-            f"⚠️ Название слишком длинное ({len(name)} симв.). "
-            f"Максимум — {MAX_BUTTON_NAME_LENGTH} символов.",
-        )
-        return
 
-    buttons = database.get_user_buttons(user_id)
-
-    if len(buttons) >= MAX_USER_BUTTONS:
-        bot.reply_to(
-            message,
-            f"⚠️ У вас уже {MAX_USER_BUTTONS} кнопок (максимум). "
-            "Удалите лишние через /ук.",
-        )
-        return
-
-    # Проверка дубликата (без учёта регистра)
-    if any(n.lower() == name.lower() for _, n in buttons):
-        bot.reply_to(
-            message,
-            f"⚠️ Кнопка «{html.escape(name)}» уже есть.",
-        )
-        return
-
-    result = database.add_user_button(user_id, name)
-    if result is None:
-        bot.reply_to(message, "❌ Не удалось добавить кнопку. Попробуйте ещё раз.")
-        return
-
-    buttons = database.get_user_buttons(user_id)
+def _send_button_usage_hint(message: types.Message):
     bot.reply_to(
         message,
-        f"✅ Кнопка «{html.escape(name)}» добавлена.",
+        "⚠️ Укажите название кнопки.\n\n"
+        "<b>Одна кнопка:</b>\n"
+        "<code>/к Проверить почту</code>\n\n"
+        "<b>Несколько кнопок через «;»:</b>\n"
+        "<code>/к Почта; Задачи; Позвонить маме</code>\n\n"
+        "<b>Несколько кнопок с новой строки:</b>\n"
+        "<code>/к Почта\nЗадачи\nПозвонить маме</code>\n\n"
+        f"Максимум кнопок: {MAX_USER_BUTTONS} · Название: до {MAX_BUTTON_NAME_LENGTH} символов.\n"
+        "Список кнопок — /кнопки",
+    )
+
+
+def _process_add_button(message: types.Message, raw: str):
+    raw     = raw.strip()
+    user_id = message.from_user.id
+
+    if not raw:
+        _send_button_usage_hint(message)
+        return
+
+    names = _parse_button_names(raw)
+
+    if not names:
+        _send_button_usage_hint(message)
+        return
+
+    # Валидация длины
+    too_long = [n for n in names if len(n) > MAX_BUTTON_NAME_LENGTH]
+    if too_long:
+        joined = ", ".join(f"«{html.escape(n)}»" for n in too_long)
+        bot.reply_to(
+            message,
+            f"⚠️ Слишком длинные названия ({MAX_BUTTON_NAME_LENGTH} симв. макс.): {joined}",
+        )
+        return
+
+    buttons = database.get_user_buttons(user_id)
+    existing_names = {n.lower() for _, n, _ in buttons}
+    free_slots = MAX_USER_BUTTONS - len(buttons)
+
+    # Дубликаты (уже есть в базе)
+    duplicates = [n for n in names if n.lower() in existing_names]
+    # Новые
+    new_names = [n for n in names if n.lower() not in existing_names]
+
+    if not new_names:
+        dupes_str = ", ".join(f"«{html.escape(n)}»" for n in duplicates)
+        bot.reply_to(message, f"⚠️ Все эти кнопки уже есть: {dupes_str}")
+        return
+
+    if len(new_names) > free_slots:
+        bot.reply_to(
+            message,
+            f"⚠️ Можно добавить ещё {free_slots} кнопок (максимум {MAX_USER_BUTTONS}), "
+            f"а вы пытаетесь добавить {len(new_names)}. Сократите список.",
+        )
+        return
+
+    added = []
+    failed = []
+    for name in new_names:
+        result = database.add_user_button(user_id, name)
+        if result is not None:
+            added.append(name)
+        else:
+            failed.append(name)
+
+    buttons = database.get_user_buttons(user_id)
+
+    lines = []
+    if added:
+        lines.append("✅ Добавлено: " + ", ".join(f"«{html.escape(n)}»" for n in added))
+    if duplicates:
+        lines.append("⚠️ Уже были: " + ", ".join(f"«{html.escape(n)}»" for n in duplicates))
+    if failed:
+        lines.append("❌ Ошибка: " + ", ".join(f"«{html.escape(n)}»" for n in failed))
+
+    bot.reply_to(
+        message,
+        "\n".join(lines),
         reply_markup=_build_user_keyboard(buttons),
     )
 
 
-def _process_remove_button(message: types.Message, identifier: str):
-    identifier = identifier.strip()
-    user_id    = message.from_user.id
+def _process_remove_button(message: types.Message, raw: str):
+    raw     = raw.strip()
+    user_id = message.from_user.id
 
-    if not identifier:
+    if not raw:
         bot.reply_to(
             message,
-            "⚠️ Укажите номер или название кнопки.\n"
-            "Пример: <code>/ук 1</code> или <code>/ук Проверить почту</code>\n"
-            "Список кнопок — /к без аргументов.",
+            "⚠️ Укажите номер или название кнопки.\n\n"
+            "<b>Одна кнопка:</b>\n"
+            "<code>/ук 1</code>  или  <code>/ук Проверить почту</code>\n\n"
+            "<b>Несколько через пробел или «;»:</b>\n"
+            "<code>/ук 1 3 5</code>  или  <code>/ук Почта; Задачи</code>\n\n"
+            "<b>Удалить все:</b>\n"
+            "<code>/ук все</code>\n\n"
+            "Список кнопок — /кнопки",
         )
         return
 
@@ -677,43 +744,75 @@ def _process_remove_button(message: types.Message, identifier: str):
         bot.reply_to(message, "У вас нет кнопок.")
         return
 
-    button_id = button_name = None
+    # Удалить все
+    if raw.strip().lower() == "все":
+        count = database.remove_all_user_buttons(user_id)
+        bot.reply_to(
+            message,
+            f"🗑 Удалено всех кнопок: {count}.",
+            reply_markup=types.ReplyKeyboardRemove(selective=True),
+        )
+        return
 
-    if identifier.isdigit():
-        idx = int(identifier) - 1  # 1-индексированный
-        if 0 <= idx < len(buttons):
-            button_id, button_name = buttons[idx]
-        else:
-            bot.reply_to(
-                message,
-                f"⚠️ Нет кнопки #{identifier}. У вас {len(buttons)} кнопок.",
-            )
-            return
+    # Парсим идентификаторы: сначала пробуем ";" как разделитель, иначе пробел
+    if ";" in raw:
+        tokens = [t.strip() for t in raw.split(";") if t.strip()]
     else:
-        for bid, bname in buttons:
-            if bname.lower() == identifier.lower():
-                button_id, button_name = bid, bname
-                break
-        if button_id is None:
-            bot.reply_to(
-                message,
-                f"⚠️ Кнопка «{html.escape(identifier)}» не найдена.",
+        tokens = raw.split()
+
+    to_delete_ids   = []
+    to_delete_names = []
+    not_found       = []
+
+    for token in tokens:
+        # По номеру (1-индексированный)
+        if token.lstrip("#").isdigit():
+            idx = int(token.lstrip("#")) - 1
+            if 0 <= idx < len(buttons):
+                bid, bname, _ = buttons[idx]
+                if bid not in to_delete_ids:
+                    to_delete_ids.append(bid)
+                    to_delete_names.append(bname)
+            else:
+                not_found.append(token)
+        else:
+            # По названию (без учёта регистра)
+            match = next(
+                ((bid, bname) for bid, bname, _ in buttons if bname.lower() == token.lower()),
+                None,
             )
-            return
+            if match:
+                bid, bname = match
+                if bid not in to_delete_ids:
+                    to_delete_ids.append(bid)
+                    to_delete_names.append(bname)
+            else:
+                not_found.append(token)
 
-    database.remove_user_button(button_id, user_id)
+    lines = []
+
+    if to_delete_ids:
+        database.remove_user_buttons(to_delete_ids, user_id)
+        deleted_str = ", ".join(f"«{html.escape(n)}»" for n in to_delete_names)
+        lines.append(f"🗑 Удалено: {deleted_str}")
+
+    if not_found:
+        nf_str = ", ".join(html.escape(t) for t in not_found)
+        lines.append(f"⚠️ Не найдено: {nf_str}")
+
     remaining = database.get_user_buttons(user_id)
+    if not remaining:
+        lines.append("Все кнопки удалены.")
 
-    suffix = "\nВсе кнопки удалены." if not remaining else ""
     bot.reply_to(
         message,
-        f"🗑 Кнопка «{html.escape(button_name)}» удалена.{suffix}",
+        "\n".join(lines),
         reply_markup=_build_user_keyboard(remaining),
     )
 
 
-# /к без аргументов — показать список кнопок
 def _show_user_buttons(message: types.Message):
+    """Показывает список кнопок с inline-кнопками Вкл/Выкл всех."""
     user_id = message.from_user.id
     buttons = database.get_user_buttons(user_id)
 
@@ -725,16 +824,76 @@ def _show_user_buttons(message: types.Message):
         )
         return
 
-    lines = [f"<b>📌 Ваши кнопки ({len(buttons)})</b>", ""]
-    for i, (_, name) in enumerate(buttons, 1):
-        lines.append(f"{i}. {html.escape(name)}")
+    active_count = sum(1 for _, _, is_active in buttons if is_active)
+    total        = len(buttons)
+
+    lines = [f"<b>📌 Ваши кнопки ({total})</b>", ""]
+    for i, (_, name, is_active) in enumerate(buttons, 1):
+        status = "" if is_active else " <i>(выкл)</i>"
+        lines.append(f"{i}. {html.escape(name)}{status}")
     lines.append("\nДля удаления: <code>/ук [номер или название]</code>")
+    lines.append("Для добавления: <code>/к [название]</code>")
+
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton("✅ Включить все",  callback_data="buttons_toggle:on"),
+        types.InlineKeyboardButton("❌ Выключить все", callback_data="buttons_toggle:off"),
+    )
 
     bot.reply_to(
         message,
         "\n".join(lines),
-        reply_markup=_build_user_keyboard(buttons),
+        reply_markup=markup,
     )
+
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("buttons_toggle:"))
+def handle_buttons_toggle(call: types.CallbackQuery):
+    """Включает или выключает все кнопки пользователя."""
+    action  = call.data.split(":")[1]
+    user_id = call.from_user.id
+    is_active = (action == "on")
+
+    database.set_all_buttons_active(user_id, is_active)
+    buttons = database.get_user_buttons(user_id)
+
+    # Обновляем reply-клавиатуру
+    try:
+        bot.send_message(
+            call.message.chat.id,
+            "✅ Все кнопки включены." if is_active else "❌ Все кнопки выключены.",
+            reply_markup=_build_user_keyboard(buttons),
+        )
+    except Exception:
+        pass
+
+    # Обновляем текст списка в исходном сообщении
+    total        = len(buttons)
+    lines = [f"<b>📌 Ваши кнопки ({total})</b>", ""]
+    for i, (_, name, btn_active) in enumerate(buttons, 1):
+        status = "" if btn_active else " <i>(выкл)</i>"
+        lines.append(f"{i}. {html.escape(name)}{status}")
+    lines.append("\nДля удаления: <code>/ук [номер или название]</code>")
+    lines.append("Для добавления: <code>/к [название]</code>")
+
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton("✅ Включить все",  callback_data="buttons_toggle:on"),
+        types.InlineKeyboardButton("❌ Выключить все", callback_data="buttons_toggle:off"),
+    )
+
+    try:
+        bot.edit_message_text(
+            "\n".join(lines),
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    bot.answer_callback_query(call.id)
 
 
 # =============================================================================
@@ -849,16 +1008,22 @@ _HELP_BUTTONS = (
     "📌 <b>Быстрые кнопки</b>\n\n"
     "Создай свои кнопки в панели ввода — они видны только тебе.\n\n"
 
-    "<b>Добавить кнопку</b>\n"
+    "<b>Добавить кнопку (или несколько)</b>\n"
     "<code>/к [название]</code>\n"
-    "Пример: <code>/к Проверить почту</code>\n\n"
+    "Несколько через «;»: <code>/к Почта; Задачи; Позвонить</code>\n"
+    "Или с новой строки:\n"
+    "<code>/к Почта\nЗадачи\nПозвонить</code>\n\n"
 
-    "<b>Удалить кнопку</b>\n"
+    "<b>Удалить кнопку (или несколько)</b>\n"
     "<code>/ук [номер или название]</code>\n"
-    "Пример: <code>/ук 1</code>  или  <code>/ук Проверить почту</code>\n\n"
+    "Несколько: <code>/ук 1 3 5</code>  или  <code>/ук Почта; Задачи</code>\n"
+    "Удалить все: <code>/ук все</code>\n\n"
 
-    "<b>Посмотреть список кнопок</b>\n"
-    "<code>/к</code> (без аргументов)\n\n"
+    "<b>Включить / выключить кнопки</b>\n"
+    "Через команду или кнопки в /кнопки\n\n"
+
+    "<b>Список кнопок</b>\n"
+    "<code>/кнопки</code>  или  <code>/buttons</code>\n\n"
 
     f"Максимум кнопок: {MAX_USER_BUTTONS} · Название: до {MAX_BUTTON_NAME_LENGTH} символов."
 )
@@ -1021,13 +1186,18 @@ def handle_add_button(message: types.Message):
     if len(parts) > 1:
         _process_add_button(message, parts[1])
     else:
-        _show_user_buttons(message)
+        _send_button_usage_hint(message)
 
 
 @bot.message_handler(commands=["ук"])
 def handle_remove_button(message: types.Message):
     parts = message.text.split(maxsplit=1)
     _process_remove_button(message, parts[1] if len(parts) > 1 else "")
+
+
+@bot.message_handler(commands=["кнопки", "buttons"])
+def handle_show_buttons(message: types.Message):
+    _show_user_buttons(message)
 
 
 # =============================================================================

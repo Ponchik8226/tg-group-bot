@@ -230,9 +230,17 @@ def init_db():
                         id          SERIAL PRIMARY KEY,
                         user_id     BIGINT NOT NULL,
                         name        TEXT NOT NULL,
+                        is_active   BOOLEAN NOT NULL DEFAULT TRUE,
                         created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
                         UNIQUE (user_id, name)
                     )
+                    """
+                )
+                # Миграция: добавляем is_active если таблица уже существовала без неё (v4)
+                cur.execute(
+                    """
+                    ALTER TABLE user_buttons
+                    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE
                     """
                 )
 
@@ -350,7 +358,7 @@ def update_timer_end_time(timer_id: int, new_end_time: float):
 
 def get_user_buttons(user_id: int) -> list:
     """
-    Возвращает кнопки пользователя: [(id, name), ...], отсортированы по id.
+    Возвращает все кнопки пользователя: [(id, name, is_active), ...], отсортированы по id.
     """
     if not db_enabled() or _pool is None:
         return []
@@ -359,7 +367,7 @@ def get_user_buttons(user_id: int) -> list:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, name FROM user_buttons "
+                    "SELECT id, name, is_active FROM user_buttons "
                     "WHERE user_id = %s ORDER BY id",
                     (user_id,),
                 )
@@ -393,7 +401,7 @@ def add_user_button(user_id: int, name: str) -> int | None:
 
 
 def remove_user_button(button_id: int, user_id: int) -> bool:
-    """Удаляет кнопку по id. Возвращает True если удалена."""
+    """Удаляет одну кнопку по id. Возвращает True если удалена."""
     if not db_enabled() or _pool is None:
         return False
 
@@ -405,6 +413,63 @@ def remove_user_button(button_id: int, user_id: int) -> bool:
                     (button_id, user_id),
                 )
                 return cur.rowcount > 0
+
+    return _run(_fn)
+
+
+def remove_user_buttons(button_ids: list, user_id: int) -> int:
+    """
+    Удаляет несколько кнопок по списку id (все должны принадлежать user_id).
+    Возвращает количество реально удалённых.
+    """
+    if not db_enabled() or _pool is None or not button_ids:
+        return 0
+
+    def _fn(conn):
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM user_buttons WHERE id = ANY(%s) AND user_id = %s",
+                    (list(button_ids), user_id),
+                )
+                return cur.rowcount
+
+    return _run(_fn)
+
+
+def remove_all_user_buttons(user_id: int) -> int:
+    """Удаляет все кнопки пользователя. Возвращает количество удалённых."""
+    if not db_enabled() or _pool is None:
+        return 0
+
+    def _fn(conn):
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM user_buttons WHERE user_id = %s",
+                    (user_id,),
+                )
+                return cur.rowcount
+
+    return _run(_fn)
+
+
+def set_all_buttons_active(user_id: int, is_active: bool) -> int:
+    """
+    Включает (is_active=True) или отключает (is_active=False) все кнопки пользователя.
+    Возвращает количество затронутых строк.
+    """
+    if not db_enabled() or _pool is None:
+        return 0
+
+    def _fn(conn):
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE user_buttons SET is_active = %s WHERE user_id = %s",
+                    (is_active, user_id),
+                )
+                return cur.rowcount
 
     return _run(_fn)
 
