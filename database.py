@@ -223,6 +223,13 @@ def init_db():
                     ADD COLUMN IF NOT EXISTS fires_remaining INT NOT NULL DEFAULT 0
                     """
                 )
+                # ID топика (Forum thread) для отправки уведомления в нужный раздел (v5)
+                cur.execute(
+                    """
+                    ALTER TABLE timers
+                    ADD COLUMN IF NOT EXISTS thread_id BIGINT
+                    """
+                )
                 # Пользовательские reply-кнопки (v3)
                 cur.execute(
                     """
@@ -254,7 +261,7 @@ def init_db():
 def insert_timer(
     chat_id, user_id, first_name, description, end_time,
     is_recurring: bool = False, interval_seconds: int = 0,
-    fires_remaining: int = 0,
+    fires_remaining: int = 0, thread_id: int | None = None,
 ):
     """Сохраняет таймер в базу и возвращает его ID (или None без БД)."""
     if not db_enabled() or _pool is None:
@@ -266,10 +273,10 @@ def insert_timer(
                 cur.execute(
                     "INSERT INTO timers "
                     "(chat_id, user_id, user_first_name, description, end_time, "
-                    " is_recurring, interval_seconds, fires_remaining) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    " is_recurring, interval_seconds, fires_remaining, thread_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                     (chat_id, user_id, first_name, description, end_time,
-                     is_recurring, interval_seconds, fires_remaining),
+                     is_recurring, interval_seconds, fires_remaining, thread_id),
                 )
                 return cur.fetchone()[0]
 
@@ -293,7 +300,7 @@ def load_all_timers():
     """
     Возвращает все сохранённые таймеры:
     (id, chat_id, user_id, first_name, description, end_time,
-     is_recurring, interval_seconds, fires_remaining)
+     is_recurring, interval_seconds, fires_remaining, thread_id)
     """
     if not db_enabled() or _pool is None:
         return []
@@ -303,7 +310,8 @@ def load_all_timers():
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, chat_id, user_id, user_first_name, description, "
-                    "       end_time, is_recurring, interval_seconds, fires_remaining "
+                    "       end_time, is_recurring, interval_seconds, "
+                    "       fires_remaining, thread_id "
                     "FROM timers"
                 )
                 return cur.fetchall()

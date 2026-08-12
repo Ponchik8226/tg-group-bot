@@ -9,6 +9,7 @@ Telegram-бот для личного использования в группе
 /del, /cancel   — удалить таймер
 /к              — добавить reply-кнопку (видна только тебе)
 /ук             — удалить кнопку
+/кнопки         — список кнопок; /кнопки вкл/выкл — включить/выключить
 
 Архитектура:
 config.py   — объект bot, переменные окружения, логирование
@@ -61,13 +62,26 @@ def _calc_max_fires(interval_seconds: int) -> int:
     return max(1, min(365, _ONE_YEAR // interval_seconds))
 
 
+def _check_callback_owner(call: types.CallbackQuery) -> bool:
+    """
+    Проверяет, что нажавший inline-кнопку — автор оригинальной команды.
+    Бот всегда отвечает reply_to, поэтому call.message.reply_to_message
+    указывает на сообщение вызвавшего команду.
+    Если reply_to_message отсутствует (ЛС, редкие кейсы) — разрешаем.
+    """
+    original = getattr(call.message, "reply_to_message", None)
+    if original is None:
+        return True
+    return call.from_user.id == original.from_user.id
+
+
 # =============================================================================
 # ХРАНИЛИЩЕ АКТИВНЫХ ТАЙМЕРОВ (В ПАМЯТИ)
 # =============================================================================
 
-# TIMERS: timer_id -> {chat_id, user_id, user_mention, description, end_time,
-#                      duration, timer_obj, is_recurring, interval_seconds,
-#                      fires_remaining}
+# TIMERS: timer_id -> {chat_id, thread_id, user_id, user_mention, description,
+#                      end_time, duration, timer_obj, is_recurring,
+#                      interval_seconds, fires_remaining}
 TIMERS: dict = {}
 
 # USER_TIMERS: user_id -> set of timer_id
@@ -122,9 +136,13 @@ def fire_timer(timer_id: int, missed: bool = False):
         text += "\n\n⚠️ Бот был выключен, когда таймер должен был сработать."
 
     # ---------- Отправка — 3 попытки ----------
+    thread_id = info.get("thread_id")  # None для обычных чатов, int для топиков
     for attempt in range(1, 4):
         try:
-            bot.send_message(info["chat_id"], text)
+            bot.send_message(
+                info["chat_id"], text,
+                message_thread_id=thread_id,
+            )
             break
         except Exception:
             if attempt < 3:
@@ -169,6 +187,7 @@ def fire_timer(timer_id: int, missed: bool = False):
                     info["chat_id"],
                     f"🔁 {info['user_mention']}, повторяющийся таймер #{timer_id} завершён — "
                     f"лимит срабатываний исчерпан.",
+                    message_thread_id=thread_id,
                 )
             except Exception:
                 logger.exception("Не удалось отправить финальное сообщение таймера #%s.", timer_id)
@@ -221,6 +240,8 @@ def create_timer(
     end_time      = time.time() + duration_seconds
     interval_secs = duration_seconds if is_recurring else 0
     fires_rem     = _calc_max_fires(duration_seconds) if is_recurring else 0
+    # message_thread_id — ID топика в Forum-чатах, None для обычных чатов
+    thread_id     = getattr(message, "message_thread_id", None)
 
     if database.db_enabled():
         timer_id = database.insert_timer(
@@ -228,6 +249,7 @@ def create_timer(
             is_recurring=is_recurring,
             interval_seconds=interval_secs,
             fires_remaining=fires_rem,
+            thread_id=thread_id,
         )
     else:
         with _timers_lock:
@@ -242,6 +264,7 @@ def create_timer(
     with _timers_lock:
         TIMERS[timer_id] = {
             "chat_id":          message.chat.id,
+            "thread_id":        thread_id,
             "user_id":          user.id,
             "user_mention":     mention,
             "description":      description,
@@ -311,7 +334,8 @@ def restore_timers():
     restored = missed = 0
 
     for (timer_id, chat_id, user_id, first_name, description,
-         end_time, is_recurring, interval_seconds, fires_remaining) in rows:
+         end_time, is_recurring, interval_seconds, fires_remaining,
+         thread_id) in rows:
 
         mention   = build_mention(user_id, first_name)
         remaining = end_time - now
@@ -324,6 +348,7 @@ def restore_timers():
         with _timers_lock:
             TIMERS[timer_id] = {
                 "chat_id":          chat_id,
+                "thread_id":        thread_id,
                 "user_id":          user_id,
                 "user_mention":     mention,
                 "description":      description,
@@ -440,6 +465,10 @@ def _show_my_timers(message: types.Message):
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("sort_timers:"))
 def handle_sort_timers(call: types.CallbackQuery):
     """Сортировка и обновление /mytimers через inline-кнопки."""
+    if not _check_callback_owner(call):
+        bot.answer_callback_query(call.id, "⛔ Это не твой список таймеров.", show_alert=False)
+        return
+
     action  = call.data.split(":")[1]
     user_id = call.from_user.id
 
@@ -836,8 +865,8 @@ def _show_user_buttons(message: types.Message):
 
     markup = types.InlineKeyboardMarkup()
     markup.row(
-        types.InlineKeyboardButton("✅ Включить все",  callback_data="buttons_toggle:on"),
-        types.InlineKeyboardButton("❌ Выключить все", callback_data="buttons_toggle:off"),
+        types.InlineKeyboardButton("✅ Включить", callback_data="buttons_toggle:on"),
+        types.InlineKeyboardButton("❌ Выключить", callback_data="buttons_toggle:off"),
     )
 
     bot.reply_to(
@@ -850,25 +879,35 @@ def _show_user_buttons(message: types.Message):
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("buttons_toggle:"))
 def handle_buttons_toggle(call: types.CallbackQuery):
     """Включает или выключает все кнопки пользователя."""
-    action  = call.data.split(":")[1]
-    user_id = call.from_user.id
+    if not _check_callback_owner(call):
+        bot.answer_callback_query(call.id, "⛔ Это не твой список кнопок.", show_alert=False)
+        return
+
+    action    = call.data.split(":")[1]
+    user_id   = call.from_user.id
     is_active = (action == "on")
 
     database.set_all_buttons_active(user_id, is_active)
     buttons = database.get_user_buttons(user_id)
 
-    # Обновляем reply-клавиатуру
+    # Обновляем reply-клавиатуру.
+    # reply_to_message_id нужен чтобы selective=True корректно
+    # адресовал клавиатуру конкретному пользователю в группе.
+    original     = getattr(call.message, "reply_to_message", None)
+    reply_msg_id = original.message_id if original else None
+    status_text  = "✅ Все кнопки включены." if is_active else "❌ Все кнопки выключены."
     try:
         bot.send_message(
             call.message.chat.id,
-            "✅ Все кнопки включены." if is_active else "❌ Все кнопки выключены.",
+            status_text,
+            reply_to_message_id=reply_msg_id,
             reply_markup=_build_user_keyboard(buttons),
         )
     except Exception:
         pass
 
-    # Обновляем текст списка в исходном сообщении
-    total        = len(buttons)
+    # Обновляем текст и инлайн-кнопки в исходном сообщении-списке
+    total = len(buttons)
     lines = [f"<b>📌 Ваши кнопки ({total})</b>", ""]
     for i, (_, name, btn_active) in enumerate(buttons, 1):
         status = "" if btn_active else " <i>(выкл)</i>"
@@ -878,8 +917,8 @@ def handle_buttons_toggle(call: types.CallbackQuery):
 
     markup = types.InlineKeyboardMarkup()
     markup.row(
-        types.InlineKeyboardButton("✅ Включить все",  callback_data="buttons_toggle:on"),
-        types.InlineKeyboardButton("❌ Выключить все", callback_data="buttons_toggle:off"),
+        types.InlineKeyboardButton("✅ Включить", callback_data="buttons_toggle:on"),
+        types.InlineKeyboardButton("❌ Выключить", callback_data="buttons_toggle:off"),
     )
 
     try:
@@ -972,10 +1011,8 @@ def _safe_track(message):
 # =============================================================================
 
 _HELP_MAIN = (
-    "🧩 <b>Выбери раздел чтобы узнать о командах:</b>\n"
-    " • ⏰ Таймеры\n"
-    " • 📌 Кнопки\n"
-    " • 💡 Прочее\n"
+    "📖 <b>Справка</b>\n\n"
+    "Выбери раздел:"
 )
 
 _HELP_TIMERS = (
@@ -1020,7 +1057,8 @@ _HELP_BUTTONS = (
     "Удалить все: <code>/ук все</code>\n\n"
 
     "<b>Включить / выключить кнопки</b>\n"
-    "Через команду или кнопки в /кнопки\n\n"
+    "<code>/кнопки вкл</code>  или  <code>/кнопки выкл</code>\n"
+    "Или через кнопки в списке /кнопки\n\n"
 
     "<b>Список кнопок</b>\n"
     "<code>/кнопки</code>  или  <code>/buttons</code>\n\n"
@@ -1066,6 +1104,10 @@ _HELP_SECTIONS = {
 
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("help:"))
 def handle_help_callback(call: types.CallbackQuery):
+    if not _check_callback_owner(call):
+        bot.answer_callback_query(call.id, "⛔ Это не твой /help.", show_alert=False)
+        return
+
     section = call.data.split(":")[1]
     if section not in _HELP_SECTIONS:
         bot.answer_callback_query(call.id)
@@ -1197,7 +1239,38 @@ def handle_remove_button(message: types.Message):
 
 @bot.message_handler(commands=["кнопки", "buttons"])
 def handle_show_buttons(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    arg   = parts[1].strip().lower() if len(parts) > 1 else ""
+    if arg in ("вкл", "on"):
+        _toggle_all_buttons(message, True)
+    elif arg in ("выкл", "off"):
+        _toggle_all_buttons(message, False)
+    else:
+        _show_user_buttons(message)
+
+
+@bot.message_handler(
+    func=lambda m: bool(re.match(r"^кнопки\b", (m.text or ""), re.IGNORECASE))
+)
+def handle_show_buttons_text(message: types.Message):
+    """Синоним "Кнопки" без слэша."""
     _show_user_buttons(message)
+
+
+def _toggle_all_buttons(message: types.Message, is_active: bool):
+    """Включает или выключает все кнопки пользователя через команду."""
+    user_id = message.from_user.id
+    buttons = database.get_user_buttons(user_id)
+
+    if not buttons:
+        bot.reply_to(message, "У вас нет кнопок.")
+        return
+
+    database.set_all_buttons_active(user_id, is_active)
+    buttons = database.get_user_buttons(user_id)
+
+    text = "✅ Все кнопки включены." if is_active else "❌ Все кнопки выключены."
+    bot.reply_to(message, text, reply_markup=_build_user_keyboard(buttons))
 
 
 # =============================================================================
