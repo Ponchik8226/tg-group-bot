@@ -113,13 +113,22 @@ def get_uptime_str() -> str:
 
 
 def split_message(text: str, limit: int = 4000):
-    """Делит длинный текст на части не длиннее limit символов по границам строк."""
+    """Делит длинный текст на части не длиннее limit символов по границам строк.
+    Если одна строка сама длиннее limit — режет её посимвольно."""
     if len(text) <= limit:
         return [text]
 
     chunks = []
     current = ""
     for line in text.split("\n"):
+        # Если одна строка сама по себе длиннее лимита — режем её посимвольно
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+
         candidate = f"{current}\n{line}" if current else line
         if len(candidate) > limit:
             if current:
@@ -127,6 +136,7 @@ def split_message(text: str, limit: int = 4000):
             current = line
         else:
             current = candidate
+
     if current:
         chunks.append(current)
     return chunks

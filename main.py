@@ -21,6 +21,7 @@ main.py     — этот файл: пользовательские хендле
 
 import html
 import os
+import queue as _queue_module
 import re
 import threading
 import time
@@ -30,7 +31,7 @@ from telebot import types
 
 import admin
 import database
-from config import bot, logger, ADMIN_IDS
+from config import bot, logger, ADMIN_IDS, WEBHOOK_SECRET
 from utils import (
     parse_duration,
     format_duration,
@@ -144,7 +145,19 @@ def fire_timer(timer_id: int, missed: bool = False):
                 message_thread_id=thread_id,
             )
             break
-        except Exception:
+        except Exception as e:
+            err_str = str(e).lower()
+            # Бот кикнут или чат удалён — дальнейшие попытки бессмысленны
+            if any(kw in err_str for kw in (
+                "bot was kicked", "chat not found", "not a member",
+                "bot is not a member", "user is deactivated",
+            )):
+                logger.warning(
+                    "Таймер #%s: бот недоступен в чате %s (%s) — удаляю таймер.",
+                    timer_id, info["chat_id"], e,
+                )
+                database.delete_timer(timer_id)
+                return
             if attempt < 3:
                 logger.warning("Попытка %d/3 отправить таймер #%s не удалась...", attempt, timer_id)
                 time.sleep(2)
@@ -159,8 +172,8 @@ def fire_timer(timer_id: int, missed: bool = False):
             new_remaining = max(0, info.get("fires_remaining", 0) - 1)
 
         if new_remaining > 0:
-            # Продолжаем цикл
-            new_end_time  = time.time() + interval
+            # Продолжаем цикл. Якоримся на предыдущий end_time — не дрейфуем.
+            new_end_time  = info["end_time"] + interval
             database.update_timer_end_time(timer_id, new_end_time)
 
             new_timer_obj = threading.Timer(interval, fire_timer, args=(timer_id,))
@@ -243,6 +256,7 @@ def create_timer(
     # message_thread_id — ID топика в Forum-чатах, None для обычных чатов
     thread_id     = getattr(message, "message_thread_id", None)
 
+    timer_id = None
     if database.db_enabled():
         timer_id = database.insert_timer(
             message.chat.id, user.id, first_name, description, end_time,
@@ -251,7 +265,9 @@ def create_timer(
             fires_remaining=fires_rem,
             thread_id=thread_id,
         )
-    else:
+
+    # Если БД недоступна или пул умер (insert вернул None) — локальный счётчик
+    if timer_id is None:
         with _timers_lock:
             timer_id = _next_timer_id
             _next_timer_id += 1
@@ -992,18 +1008,33 @@ def track_message_stats(message: types.Message):
     )
 
 
+# Очередь и воркер: один фоновый поток вместо нового на каждое сообщение.
+# maxsize=2000 — при переполнении просто пропускаем, не блокируем бот.
+_stats_queue: _queue_module.Queue = _queue_module.Queue(maxsize=2000)
+
+
+def _start_stats_worker():
+    """Запускает единственный фоновый поток для записи статистики."""
+    def _worker():
+        logger.info("Воркер статистики запущен.")
+        while True:
+            msg = _stats_queue.get()
+            try:
+                track_message_stats(msg)
+            except Exception:
+                logger.exception("Ошибка при записи статистики сообщения.")
+            finally:
+                _stats_queue.task_done()
+
+    threading.Thread(target=_worker, daemon=True, name="stats-worker").start()
+
+
 @bot.middleware_handler(update_types=["message"])
 def stats_middleware(bot_instance, message):
-    threading.Thread(
-        target=lambda: _safe_track(message), daemon=True
-    ).start()
-
-
-def _safe_track(message):
     try:
-        track_message_stats(message)
-    except Exception:
-        logger.exception("Ошибка при записи статистики сообщения.")
+        _stats_queue.put_nowait(message)
+    except _queue_module.Full:
+        logger.warning("Очередь статистики переполнена, сообщение пропущено.")
 
 
 # =============================================================================
@@ -1162,8 +1193,14 @@ def handle_help(message: types.Message):
 
 @bot.message_handler(commands=["id"])
 def handle_id(message: types.Message):
+    if not _is_for_me(message):
+        return
     if message.reply_to_message:
-        t         = message.reply_to_message.from_user
+        t = message.reply_to_message.from_user
+        if t is None:
+            # Автофорвард из канала — нет пользователя
+            bot.reply_to(message, "❌ У этого сообщения нет автора (автофорвард из канала).")
+            return
         name      = html.escape(t.first_name or t.username or str(t.id))
         bot_label = " (бот)" if t.is_bot else ""
         bot.reply_to(message, f"🆔 ID <b>{name}</b>{bot_label}: <code>{t.id}</code>")
@@ -1175,6 +1212,8 @@ def handle_id(message: types.Message):
 
 @bot.message_handler(commands=["ping"])
 def handle_ping(message: types.Message):
+    if not _is_for_me(message):
+        return
     start = time.perf_counter()
     sent  = bot.send_message(message.chat.id, "🏓 Pong!")
     ms    = (time.perf_counter() - start) * 1000
@@ -1187,18 +1226,24 @@ def handle_ping(message: types.Message):
 
 @bot.message_handler(commands=["t", "т"])
 def handle_timer(message: types.Message):
+    if not _is_for_me(message):
+        return
     parts = message.text.split(maxsplit=1)
     _process_timer_request(message, parts[1] if len(parts) > 1 else "")
 
 
 @bot.message_handler(commands=["tr", "тр"])
 def handle_recurring_timer(message: types.Message):
+    if not _is_for_me(message):
+        return
     parts = message.text.split(maxsplit=1)
     _process_recurring_request(message, parts[1] if len(parts) > 1 else "")
 
 
 @bot.message_handler(commands=["mytimers"])
 def handle_mytimers(message: types.Message):
+    if not _is_for_me(message):
+        return
     _show_my_timers(message)
 
 
@@ -1211,6 +1256,8 @@ def handle_mytimers_text(message: types.Message):
 
 @bot.message_handler(commands=["del", "del_timer", "cancel"])
 def handle_cancel(message: types.Message):
+    if not _is_for_me(message):
+        return
     parts = message.text.split(maxsplit=1)
     _process_cancel_request(message, parts[1] if len(parts) > 1 else "")
 
@@ -1225,6 +1272,8 @@ def handle_cancel_text(message: types.Message):
 
 @bot.message_handler(commands=["к"])
 def handle_add_button(message: types.Message):
+    if not _is_for_me(message):
+        return
     parts = message.text.split(maxsplit=1)
     if len(parts) > 1:
         _process_add_button(message, parts[1])
@@ -1234,12 +1283,16 @@ def handle_add_button(message: types.Message):
 
 @bot.message_handler(commands=["ук"])
 def handle_remove_button(message: types.Message):
+    if not _is_for_me(message):
+        return
     parts = message.text.split(maxsplit=1)
     _process_remove_button(message, parts[1] if len(parts) > 1 else "")
 
 
 @bot.message_handler(commands=["кнопки", "buttons"])
 def handle_show_buttons(message: types.Message):
+    if not _is_for_me(message):
+        return
     parts = message.text.split(maxsplit=1)
     arg   = parts[1].strip().lower() if len(parts) > 1 else ""
     if arg in ("вкл", "on"):
@@ -1295,6 +1348,13 @@ def health_check():
 
 @web_app.route("/webhook", methods=["POST"])
 def webhook():
+    # Проверяем секретный токен (защита от поддельных запросов)
+    if WEBHOOK_SECRET:
+        incoming = flask_request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if incoming != WEBHOOK_SECRET:
+            logger.warning("Webhook: отклонён запрос с неверным секретным токеном.")
+            return "forbidden", 403
+
     if flask_request.headers.get("content-type") == "application/json":
         update = types.Update.de_json(flask_request.get_data(as_text=True))
         bot.process_new_updates([update])
@@ -1321,7 +1381,8 @@ def main():
     database.init_db()
     restore_timers()
     _start_timer_poller()
-    admin.register(_BOT_USERNAME)
+    _start_stats_worker()
+    admin.register()
 
     webhook_url = os.environ.get("WEBHOOK_URL", "").rstrip("/")
     if not webhook_url:
@@ -1336,11 +1397,17 @@ def main():
 
     bot.remove_webhook()
     time.sleep(1)
-    bot.set_webhook(
+
+    set_webhook_kwargs = dict(
         url=f"{webhook_url}/webhook",
         drop_pending_updates=True,
-        allowed_updates=["message", "edited_message", "channel_post", "callback_query"],
+        # Только нужные типы — убираем edited_message и channel_post
+        allowed_updates=["message", "callback_query"],
     )
+    if WEBHOOK_SECRET:
+        set_webhook_kwargs["secret_token"] = WEBHOOK_SECRET
+
+    bot.set_webhook(**set_webhook_kwargs)
     logger.info("Webhook: %s/webhook", webhook_url)
 
     port = int(os.environ.get("PORT", 10000))

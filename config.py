@@ -43,6 +43,14 @@ for _raw_id in os.environ.get("ADMIN_IDS", "").split(","):
         ADMIN_IDS.add(int(_raw_id))
 
 
+# --- Безопасность вебхука ---------------------------------------------------
+
+# Секретный токен для проверки запросов от Telegram.
+# Задайте случайную строку в Render → Environment: WEBHOOK_SECRET
+# Сгенерировать: python -c "import secrets; print(secrets.token_hex(32))"
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
+
 # --- Логирование ------------------------------------------------------------
 
 logging.basicConfig(

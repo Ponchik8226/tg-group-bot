@@ -319,13 +319,14 @@ def load_all_timers():
     return _run(_fn)
 
 
-def decrement_timer_fires(timer_id: int) -> int:
+def decrement_timer_fires(timer_id: int) -> int | None:
     """
     Атомарно уменьшает fires_remaining на 1.
     Возвращает новое значение (0 = лимит исчерпан).
+    None — если БД недоступна (main.py в этом случае считает в памяти).
     """
     if not db_enabled() or _pool is None:
-        return 0
+        return None  # сигнал: считать в памяти
 
     def _fn(conn):
         with conn:
@@ -386,8 +387,9 @@ def get_user_buttons(user_id: int) -> list:
 
 def add_user_button(user_id: int, name: str) -> int | None:
     """
-    Добавляет кнопку пользователю. Возвращает id новой кнопки или None
-    если кнопка с таким названием уже есть (UNIQUE constraint).
+    Добавляет кнопку пользователю.
+    Возвращает id новой кнопки, или None если кнопка с таким именем уже есть.
+    Реальные ошибки БД пробрасываются наверх (не глотаются как «дубликат»).
     """
     if not db_enabled() or _pool is None:
         return None
@@ -395,15 +397,14 @@ def add_user_button(user_id: int, name: str) -> int | None:
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                try:
-                    cur.execute(
-                        "INSERT INTO user_buttons (user_id, name) "
-                        "VALUES (%s, %s) RETURNING id",
-                        (user_id, name),
-                    )
-                    return cur.fetchone()[0]
-                except Exception:
-                    return None  # дубликат
+                # ON CONFLICT DO NOTHING: вернёт строку при вставке, ничего — при дубликате
+                cur.execute(
+                    "INSERT INTO user_buttons (user_id, name) "
+                    "VALUES (%s, %s) ON CONFLICT (user_id, name) DO NOTHING RETURNING id",
+                    (user_id, name),
+                )
+                row = cur.fetchone()
+                return row[0] if row else None  # None = дубликат
 
     return _run(_fn)
 
@@ -622,6 +623,9 @@ def find_chats_by_name(query: str):
     if not db_enabled() or _pool is None:
         return []
 
+    # Экранируем спецсимволы LIKE чтобы запрос "100%" не дал неожиданных совпадений
+    safe_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
@@ -629,11 +633,11 @@ def find_chats_by_name(query: str):
                     """
                     SELECT chat_id, title, chat_type
                     FROM chats
-                    WHERE LOWER(title) LIKE LOWER(%s)
+                    WHERE LOWER(title) LIKE LOWER(%s) ESCAPE '\\'
                     ORDER BY title
                     LIMIT 10
                     """,
-                    (f"%{query}%",),
+                    (f"%{safe_query}%",),
                 )
                 return cur.fetchall()
 

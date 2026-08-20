@@ -18,7 +18,7 @@ import math
 from telebot import types
 
 import database
-from config import bot, logger, ADMIN_IDS
+from config import bot, ADMIN_IDS
 from utils import split_message, build_stats_report, build_clickable_name, rank_label
 
 
@@ -195,7 +195,7 @@ ADMIN_HELP_TEXT = (
 #                          ХЕНДЛЕРЫ
 # =============================================================================
 
-def register(bot_username: str):
+def register():
     """Регистрирует все хендлеры админ-команд."""
 
     @bot.message_handler(
@@ -295,11 +295,12 @@ def register(bot_username: str):
             return
         page = 0
         text, keyboard, total = _build_global_page(page)
+        sent = bot.send_message(message.chat.id, text, reply_markup=keyboard)
         _pagination[message.from_user.id] = {
             "mode": "global", "chat_id": None,
             "chat_title": "", "page": page, "total": total,
+            "message_id": sent.message_id,
         }
-        bot.send_message(message.chat.id, text, reply_markup=keyboard)
 
     # --- топ беседы / топ чаты ---
     @bot.message_handler(
@@ -313,11 +314,12 @@ def register(bot_username: str):
             return
         page = 0
         text, keyboard, total = _build_chats_top_page(page)
+        sent = bot.send_message(message.chat.id, text, reply_markup=keyboard)
         _pagination[message.from_user.id] = {
             "mode": "chats_top", "chat_id": None,
             "chat_title": "", "page": page, "total": total,
+            "message_id": sent.message_id,
         }
-        bot.send_message(message.chat.id, text, reply_markup=keyboard)
 
     # --- топ [чат] ---
     @bot.message_handler(
@@ -444,7 +446,7 @@ def register(bot_username: str):
 
     # --- Callback-хендлеры для пагинации ---
 
-    @bot.callback_query_handler(func=lambda c: c.data.startswith("top_") or c.data.startswith("stats_"))
+    @bot.callback_query_handler(func=lambda c: c.data and (c.data.startswith("top_") or c.data.startswith("stats_")))
     def handle_callbacks(call: types.CallbackQuery):
         user_id = call.from_user.id
 
@@ -481,6 +483,7 @@ def register(bot_username: str):
             _pagination[user_id] = {
                 "mode": "chat", "chat_id": chat_id,
                 "chat_title": chat_title, "page": page, "total": total,
+                "message_id": call.message.message_id,
             }
             bot.edit_message_text(
                 text, call.message.chat.id, call.message.message_id,
@@ -492,7 +495,8 @@ def register(bot_username: str):
         # Глобальный топ
         if call.data in ("top_global_prev", "top_global_next"):
             state = _pagination.get(user_id)
-            if not state or state.get("mode") != "global":
+            if not state or state.get("mode") != "global" \
+                    or state.get("message_id") != call.message.message_id:
                 bot.answer_callback_query(call.id, "Начните заново: напишите «топ вся»")
                 return
             direction = 1 if call.data == "top_global_next" else -1
@@ -510,7 +514,8 @@ def register(bot_username: str):
         # Топ по чату
         if call.data in ("top_chat_prev", "top_chat_next"):
             state = _pagination.get(user_id)
-            if not state or state.get("mode") != "chat":
+            if not state or state.get("mode") != "chat" \
+                    or state.get("message_id") != call.message.message_id:
                 bot.answer_callback_query(call.id, "Начните заново: напишите «топ [чат]»")
                 return
             direction = 1 if call.data == "top_chat_next" else -1
@@ -530,7 +535,8 @@ def register(bot_username: str):
         # Топ бесед
         if call.data in ("top_chats_prev", "top_chats_next"):
             state = _pagination.get(user_id)
-            if not state or state.get("mode") != "chats_top":
+            if not state or state.get("mode") != "chats_top" \
+                    or state.get("message_id") != call.message.message_id:
                 bot.answer_callback_query(call.id, "Начните заново: напишите «топ беседы»")
                 return
             direction = 1 if call.data == "top_chats_next" else -1
@@ -550,11 +556,12 @@ def register(bot_username: str):
     def _send_chat_top(chat_id_to_send: int, user_id: int, chat_id: int, chat_title: str):
         page = 0
         text, keyboard, total = _build_chat_page(chat_id, chat_title, page)
+        sent = bot.send_message(chat_id_to_send, text, reply_markup=keyboard)
         _pagination[user_id] = {
             "mode": "chat", "chat_id": chat_id,
             "chat_title": chat_title, "page": page, "total": total,
+            "message_id": sent.message_id,
         }
-        bot.send_message(chat_id_to_send, text, reply_markup=keyboard)
 
     def _send_chat_stats(chat_id_to_send: int, chat_id: int, chat_title: str):
         text = _build_chat_stats_text(chat_id, chat_title)
