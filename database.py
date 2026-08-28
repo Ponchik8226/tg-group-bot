@@ -97,6 +97,9 @@ def _run(fn):
     Сломанное соединение закрывается и удаляется из пула, пул сам
     создаёт новое при следующем getconn().
     """
+    if _pool is None:
+        logger.error("_run() вызван при _pool=None — пропуск запроса.")
+        return None
     last_exc = None
     for attempt in range(1, 4):
         conn = _get_conn()
@@ -249,6 +252,19 @@ def init_db():
                     ALTER TABLE user_buttons
                     ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE
                     """
+                )
+                # Индексы для частых запросов
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ucs_chat_id "
+                    "ON user_chat_stats (chat_id)"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ucs_messages "
+                    "ON user_chat_stats (messages_count DESC)"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ub_user_id "
+                    "ON user_buttons (user_id)"
                 )
 
     _run(_fn)

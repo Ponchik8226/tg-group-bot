@@ -95,21 +95,7 @@ def build_clickable_name(user_id: int, username: str | None, first_name: str | N
 
 def get_uptime_str() -> str:
     """Аптайм бота с момента запуска, например "1д 5ч 30м 10с"."""
-    uptime_seconds = int(time.time() - START_TIME)
-    days, remainder = divmod(uptime_seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, seconds = divmod(remainder, 60)
-
-    parts = []
-    if days:
-        parts.append(f"{days}д")
-    if hours:
-        parts.append(f"{hours}ч")
-    if minutes:
-        parts.append(f"{minutes}м")
-    parts.append(f"{seconds}с")
-
-    return " ".join(parts)
+    return format_duration(int(time.time() - START_TIME))
 
 
 def split_message(text: str, limit: int = 4000):
@@ -142,59 +128,4 @@ def split_message(text: str, limit: int = 4000):
     return chunks
 
 
-def build_stats_report() -> str:
-    """Формирует текст отчёта /стата: сводка + топ-5 по активности (только из бесед)."""
-    import database  # импорт здесь чтобы избежать циклических зависимостей
 
-    total_users, _, totals = database.get_stats_overview()
-    group_count, private_count = database.get_chats_count_by_type()
-    # Топ-5 только из групп (chat_type != 'private')
-    top_rows = database.get_top_activity_groups(limit=5)
-
-    lines = [
-        "<b>📊 Общая статистика</b>",
-        "",
-        f"👤 Пользователей: {total_users}",
-        f"💬 Бесед: {group_count}",
-        f"📩 Личок: {private_count}",
-        f"✉️ Сообщений: {totals['messages']}",
-        f"🔠 Символов: {totals['chars']}",
-        f"🎟 Стикеров: {totals['stickers']}",
-        f"🖼 Фото: {totals['photos']}",
-        f"🎬 Видео: {totals['videos']}",
-        f"🎤 Голосовых: {totals['voice']}",
-        f"🎞 GIF: {totals['gifs']}",
-        f"↩️ Пересланных: {totals['forwards']}",
-    ]
-
-    if top_rows:
-        lines.append("")
-        lines.append("<b>🏆 Топ-5 активных (беседы)</b>")
-        for i, row in enumerate(top_rows, start=1):
-            user_id, username, first_name, chat_title, \
-                messages, chars, stickers, photos, videos, voice, gifs, forwards = row
-
-            name = build_clickable_name(user_id, username, first_name)
-            chat_label = html.escape(chat_title or "Без названия")
-
-            extra_parts = []
-            if stickers:
-                extra_parts.append(f"стикеры {stickers}")
-            if photos:
-                extra_parts.append(f"фото {photos}")
-            if videos:
-                extra_parts.append(f"видео {videos}")
-            if voice:
-                extra_parts.append(f"голосовые {voice}")
-            if gifs:
-                extra_parts.append(f"gif {gifs}")
-            if forwards:
-                extra_parts.append(f"пересланных {forwards}")
-            extra = f" ({', '.join(extra_parts)})" if extra_parts else ""
-
-            lines.append(
-                f"{rank_label(i)} {name} — {chat_label}: "
-                f"{messages} сообщений, {chars} символов{extra}"
-            )
-
-    return "\n".join(lines)

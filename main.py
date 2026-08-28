@@ -19,15 +19,18 @@ admin.py    — все команды для администраторов
 main.py     — этот файл: пользовательские хендлеры, middleware, Flask, запуск
 """
 
+import atexit
 import html
 import os
 import queue as _queue_module
 import re
+import sys
 import threading
 import time
 
 from flask import Flask, request as flask_request
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 
 import admin
 import database
@@ -38,7 +41,6 @@ from utils import (
     build_mention,
     get_uptime_str,
     split_message,
-    build_stats_report,
 )
 
 # =============================================================================
@@ -92,7 +94,25 @@ _next_timer_id = 1
 _timers_lock   = threading.Lock()
 
 # Текущий режим сортировки /mytimers: user_id -> "id" | "time"
-_sort_state: dict[int, str] = {}
+
+
+class _BoundedDict(dict):
+    """Dict с ограничением размера — при переполнении удаляет самые старые записи."""
+
+    __slots__ = ("_maxsize",)
+
+    def __init__(self, maxsize: int = 500):
+        super().__init__()
+        self._maxsize = maxsize
+
+    def __setitem__(self, key, value):
+        if key not in self and len(self) >= self._maxsize:
+            oldest = next(iter(self))
+            del self[oldest]
+        super().__setitem__(key, value)
+
+
+_sort_state: _BoundedDict = _BoundedDict(500)
 
 # =============================================================================
 # ЛОГИКА ТАЙМЕРОВ
@@ -109,16 +129,20 @@ def fire_timer(timer_id: int, missed: bool = False):
       - Если лимит исчерпан → удаляет из БД и уведомляет.
     """
     with _timers_lock:
-        info = TIMERS.pop(timer_id, None)
-        if info is not None:
+        info = TIMERS.get(timer_id)
+        if info is None:
+            logger.info("Таймер #%s: уже был отменён, пропускаю.", timer_id)
+            return
+        is_recurring = info.get("is_recurring", False)
+        # Для одноразовых таймеров — удаляем из TIMERS сразу.
+        # Для повторяющихся — оставляем, чтобы /del мог их найти.
+        if not is_recurring:
+            TIMERS.pop(timer_id, None)
             USER_TIMERS.get(info["user_id"], set()).discard(timer_id)
+        # Копируем info чтобы работать без лока
+        info = dict(info)
 
-    if info is None:
-        logger.info("Таймер #%s: уже был отменён, пропускаю.", timer_id)
-        return
-
-    is_recurring = info.get("is_recurring", False)
-    interval     = info.get("interval_seconds", 0)
+    interval = info.get("interval_seconds", 0)
 
     logger.info(
         "Таймер #%s сработал (chat_id=%s, user_id=%s, missed=%s, recurring=%s).",
@@ -138,12 +162,14 @@ def fire_timer(timer_id: int, missed: bool = False):
 
     # ---------- Отправка — 3 попытки ----------
     thread_id = info.get("thread_id")  # None для обычных чатов, int для топиков
+    send_ok = False
     for attempt in range(1, 4):
         try:
             bot.send_message(
                 info["chat_id"], text,
                 message_thread_id=thread_id,
             )
+            send_ok = True
             break
         except Exception as e:
             err_str = str(e).lower()
@@ -156,6 +182,9 @@ def fire_timer(timer_id: int, missed: bool = False):
                     "Таймер #%s: бот недоступен в чате %s (%s) — удаляю таймер.",
                     timer_id, info["chat_id"], e,
                 )
+                with _timers_lock:
+                    TIMERS.pop(timer_id, None)
+                    USER_TIMERS.get(info["user_id"], set()).discard(timer_id)
                 database.delete_timer(timer_id)
                 return
             if attempt < 3:
@@ -166,20 +195,38 @@ def fire_timer(timer_id: int, missed: bool = False):
 
     # ---------- Рестарт или завершение ----------
     if is_recurring and interval:
+        now = time.time()
+        old_end_time = info["end_time"]
+
+        # Пропускаем все пропущенные интервалы чтобы не было лавины сообщений
+        if old_end_time + interval < now:
+            skipped = int((now - old_end_time) // interval)
+        else:
+            skipped = 0
+
+        # Декрементируем fires_remaining с учётом пропущенных интервалов
         new_remaining = database.decrement_timer_fires(timer_id)
         # Если БД недоступна — считаем в памяти
         if new_remaining is None:
             new_remaining = max(0, info.get("fires_remaining", 0) - 1)
+        # Вычитаем пропущенные интервалы из оставшихся
+        new_remaining = max(0, new_remaining - skipped)
 
         if new_remaining > 0:
             # Продолжаем цикл. Якоримся на предыдущий end_time — не дрейфуем.
-            new_end_time  = info["end_time"] + interval
+            new_end_time = old_end_time + interval * (skipped + 1)
+            delay = max(1, new_end_time - now)
             database.update_timer_end_time(timer_id, new_end_time)
 
-            new_timer_obj = threading.Timer(interval, fire_timer, args=(timer_id,))
+            new_timer_obj = threading.Timer(delay, fire_timer, args=(timer_id,))
             new_timer_obj.daemon = True
 
             with _timers_lock:
+                # Проверяем, не был ли таймер отменён пока мы отправляли сообщение
+                if timer_id not in TIMERS:
+                    new_timer_obj.cancel()
+                    logger.info("Таймер #%s был отменён во время срабатывания.", timer_id)
+                    return
                 TIMERS[timer_id] = {
                     **info,
                     "end_time":        new_end_time,
@@ -190,9 +237,22 @@ def fire_timer(timer_id: int, missed: bool = False):
                 USER_TIMERS.setdefault(info["user_id"], set()).add(timer_id)
 
             new_timer_obj.start()
-            logger.info("Повторяющийся таймер #%s перезапланирован, осталось %s раз.", timer_id, new_remaining)
+            if skipped:
+                logger.info(
+                    "Повторяющийся таймер #%s: пропущено %s интервалов, "
+                    "перезапланирован, осталось %s раз.",
+                    timer_id, skipped, new_remaining,
+                )
+            else:
+                logger.info(
+                    "Повторяющийся таймер #%s перезапланирован, осталось %s раз.",
+                    timer_id, new_remaining,
+                )
         else:
             # Лимит исчерпан — удаляем
+            with _timers_lock:
+                TIMERS.pop(timer_id, None)
+                USER_TIMERS.get(info["user_id"], set()).discard(timer_id)
             database.delete_timer(timer_id)
             logger.info("Повторяющийся таймер #%s завершён: лимит срабатываний исчерпан.", timer_id)
             try:
@@ -339,12 +399,19 @@ def cancel_timer(timer_id: int, user_id: int) -> str:
 
 def restore_timers():
     """При старте восстанавливает таймеры из БД."""
+    global _next_timer_id
     if not database.db_enabled():
         return
 
     rows = database.load_all_timers()
     if not rows:
         return
+
+    # Инициализируем счётчик ID чтобы не было коллизий с ID из БД
+    max_db_id = max(r[0] for r in rows)
+    with _timers_lock:
+        if _next_timer_id <= max_db_id:
+            _next_timer_id = max_db_id + 1
 
     now = time.time()
     restored = missed = 0
@@ -503,8 +570,9 @@ def handle_sort_timers(call: types.CallbackQuery):
             reply_markup=markup,
             parse_mode="HTML",
         )
-    except Exception:
-        pass  # "message is not modified" — нормально
+    except ApiTelegramException as e:
+        if "message is not modified" not in str(e):
+            logger.warning("Ошибка edit_message (sort_timers): %s", e)
 
     bot.answer_callback_query(call.id)
 
@@ -872,7 +940,7 @@ def _show_user_buttons(message: types.Message):
     active_count = sum(1 for _, _, is_active in buttons if is_active)
     total        = len(buttons)
 
-    lines = [f"<b>📌 Ваши кнопки ({total})</b>", ""]
+    lines = [f"<b>📌 Ваши кнопки ({active_count}/{total})</b>", ""]
     for i, (_, name, is_active) in enumerate(buttons, 1):
         status = "" if is_active else " <i>(выкл)</i>"
         lines.append(f"{i}. {html.escape(name)}{status}")
@@ -919,12 +987,13 @@ def handle_buttons_toggle(call: types.CallbackQuery):
             reply_to_message_id=reply_msg_id,
             reply_markup=_build_user_keyboard(buttons),
         )
-    except Exception:
-        pass
+    except ApiTelegramException as e:
+        logger.warning("Ошибка send_message (buttons_toggle): %s", e)
 
     # Обновляем текст и инлайн-кнопки в исходном сообщении-списке
+    active_count = sum(1 for _, _, a in buttons if a)
     total = len(buttons)
-    lines = [f"<b>📌 Ваши кнопки ({total})</b>", ""]
+    lines = [f"<b>📌 Ваши кнопки ({active_count}/{total})</b>", ""]
     for i, (_, name, btn_active) in enumerate(buttons, 1):
         status = "" if btn_active else " <i>(выкл)</i>"
         lines.append(f"{i}. {html.escape(name)}{status}")
@@ -945,8 +1014,9 @@ def handle_buttons_toggle(call: types.CallbackQuery):
             reply_markup=markup,
             parse_mode="HTML",
         )
-    except Exception:
-        pass
+    except ApiTelegramException as e:
+        if "message is not modified" not in str(e):
+            logger.warning("Ошибка edit_message (buttons_toggle): %s", e)
 
     bot.answer_callback_query(call.id)
 
@@ -1019,11 +1089,21 @@ def _start_stats_worker():
         logger.info("Воркер статистики запущен.")
         while True:
             msg = _stats_queue.get()
+            batch = [msg]
+            # Забираем все ожидающие сообщения из очереди (батчинг)
             try:
-                track_message_stats(msg)
-            except Exception:
-                logger.exception("Ошибка при записи статистики сообщения.")
-            finally:
+                while len(batch) < 100:
+                    batch.append(_stats_queue.get_nowait())
+            except _queue_module.Empty:
+                pass
+
+            for m in batch:
+                try:
+                    track_message_stats(m)
+                except Exception:
+                    logger.exception("Ошибка при записи статистики сообщения.")
+
+            for _ in batch:
                 _stats_queue.task_done()
 
     threading.Thread(target=_worker, daemon=True, name="stats-worker").start()
@@ -1154,8 +1234,9 @@ def handle_help_callback(call: types.CallbackQuery):
             reply_markup=markup_fn(),
             parse_mode="HTML",
         )
-    except Exception:
-        pass
+    except ApiTelegramException as e:
+        if "message is not modified" not in str(e):
+            logger.warning("Ошибка edit_message (help): %s", e)
     bot.answer_callback_query(call.id)
 
 
@@ -1167,6 +1248,9 @@ _BOT_USERNAME = ""
 
 
 def _is_for_me(message: types.Message) -> bool:
+    """Проверяет, адресована ли команда этому боту (по @username)."""
+    if not _BOT_USERNAME:
+        return True  # fallback: не удалось получить username бота
     text = message.text or ""
     if "@" not in text:
         return True
@@ -1251,6 +1335,8 @@ def handle_mytimers(message: types.Message):
     func=lambda m: bool(re.match(r"^таймеры\b", (m.text or ""), re.IGNORECASE))
 )
 def handle_mytimers_text(message: types.Message):
+    if not _is_for_me(message):
+        return
     _show_my_timers(message)
 
 
@@ -1263,7 +1349,7 @@ def handle_cancel(message: types.Message):
 
 
 @bot.message_handler(
-    func=lambda m: bool(re.match(r"^(удалить|отмена)\b", (m.text or ""), re.IGNORECASE))
+    func=lambda m: bool(re.match(r"^(удалить|отмена)\s+#?\d+\s*$", (m.text or ""), re.IGNORECASE))
 )
 def handle_cancel_text(message: types.Message):
     parts = message.text.split(maxsplit=1)
@@ -1308,6 +1394,8 @@ def handle_show_buttons(message: types.Message):
 )
 def handle_show_buttons_text(message: types.Message):
     """Синоним "Кнопки" без слэша — поддерживает вкл/выкл."""
+    if not _is_for_me(message):
+        return
     parts = (message.text or "").split(maxsplit=1)
     arg   = parts[1].strip().lower() if len(parts) > 1 else ""
     if arg in ("вкл", "on"):
@@ -1355,7 +1443,7 @@ def webhook():
             logger.warning("Webhook: отклонён запрос с неверным секретным токеном.")
             return "forbidden", 403
 
-    if flask_request.headers.get("content-type") == "application/json":
+    if flask_request.is_json:
         update = types.Update.de_json(flask_request.get_data(as_text=True))
         bot.process_new_updates([update])
         return "ok", 200
@@ -1366,8 +1454,15 @@ def webhook():
 # ТОЧКА ВХОДА
 # =============================================================================
 
-def main():
-    global _BOT_USERNAME
+_initialized = False
+
+
+def _init_all():
+    """Инициализация бота: БД, таймеры, воркеры, админ-хендлеры."""
+    global _initialized, _BOT_USERNAME
+    if _initialized:
+        return
+    _initialized = True
 
     logger.info("Бот запускается...")
 
@@ -1376,24 +1471,22 @@ def main():
         _BOT_USERNAME = me.username or ""
         logger.info("Бот: @%s (id=%s)", _BOT_USERNAME, me.id)
     except Exception:
-        logger.exception("Не удалось получить информацию о боте.")
+        logger.critical("Не удалось получить информацию о боте — завершение.")
+        sys.exit(1)
 
     database.init_db()
     restore_timers()
     _start_timer_poller()
     _start_stats_worker()
     admin.register()
+    _register_shutdown()
 
+
+def _setup_webhook() -> bool:
+    """Устанавливает webhook если задан WEBHOOK_URL. Возвращает True если установлен."""
     webhook_url = os.environ.get("WEBHOOK_URL", "").rstrip("/")
     if not webhook_url:
-        logger.warning("WEBHOOK_URL не задан — polling (только локально).")
-        while True:
-            try:
-                bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
-            except Exception:
-                logger.exception("Polling упал, перезапуск через 5 сек...")
-                time.sleep(5)
-        return
+        return False
 
     bot.remove_webhook()
     time.sleep(1)
@@ -1409,9 +1502,51 @@ def main():
 
     bot.set_webhook(**set_webhook_kwargs)
     logger.info("Webhook: %s/webhook", webhook_url)
+    return True
+
+
+def _register_shutdown():
+    """Регистрирует graceful shutdown: отменяет все активные таймеры при завершении."""
+    def _shutdown():
+        logger.info("Graceful shutdown: отмена %d активных таймеров...", len(TIMERS))
+        with _timers_lock:
+            for info in TIMERS.values():
+                t = info.get("timer_obj")
+                if t:
+                    t.cancel()
+
+    atexit.register(_shutdown)
+
+
+def create_app():
+    """
+    Фабрика Flask-приложения для Gunicorn.
+
+    Использование:
+        gunicorn "main:create_app()" --bind 0.0.0.0:$PORT --workers 1 --threads 4
+
+    ВАЖНО: используйте строго 1 worker — таймеры хранятся в памяти процесса.
+    """
+    _init_all()
+    _setup_webhook()
+    return web_app
+
+
+def main():
+    _init_all()
+
+    if not _setup_webhook():
+        logger.warning("WEBHOOK_URL не задан — polling (только локально).")
+        while True:
+            try:
+                bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+            except Exception:
+                logger.exception("Polling упал, перезапуск через 5 сек...")
+                time.sleep(5)
+        return
 
     port = int(os.environ.get("PORT", 10000))
-    logger.info("Flask на порту %s", port)
+    logger.info("Flask dev-сервер на порту %s (для прода — gunicorn)", port)
     web_app.run(host="0.0.0.0", port=port, threaded=True)
 
 

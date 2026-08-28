@@ -18,8 +18,8 @@ import math
 from telebot import types
 
 import database
-from config import bot, ADMIN_IDS
-from utils import split_message, build_stats_report, build_clickable_name, rank_label
+from config import bot, ADMIN_IDS, logger
+from utils import split_message, build_clickable_name, rank_label
 
 
 # =============================================================================
@@ -66,7 +66,25 @@ def _fmt_row_stats(messages, chars, stickers, photos, videos, voice, gifs, forwa
 
 # {user_id: {"mode": "global"|"chat"|"chats_top", "chat_id": int|None,
 #             "chat_title": str, "page": int, "total": int}}
-_pagination = {}
+
+
+class _BoundedDict(dict):
+    """Dict с ограничением размера — при переполнении удаляет самые старые записи."""
+
+    __slots__ = ("_maxsize",)
+
+    def __init__(self, maxsize: int = 500):
+        super().__init__()
+        self._maxsize = maxsize
+
+    def __setitem__(self, key, value):
+        if key not in self and len(self) >= self._maxsize:
+            oldest = next(iter(self))
+            del self[oldest]
+        super().__setitem__(key, value)
+
+
+_pagination: _BoundedDict = _BoundedDict(500)
 
 
 def _total_pages(total: int) -> int:
@@ -191,6 +209,62 @@ ADMIN_HELP_TEXT = (
 )
 
 
+
+def build_stats_report() -> str:
+    """Формирует текст отчёта /стата: сводка + топ-5 по активности (только из бесед)."""
+    total_users, _, totals = database.get_stats_overview()
+    group_count, private_count = database.get_chats_count_by_type()
+    top_rows = database.get_top_activity_groups(limit=5)
+
+    lines = [
+        "<b>📊 Общая статистика</b>",
+        "",
+        f"👤 Пользователей: {total_users}",
+        f"💬 Бесед: {group_count}",
+        f"📩 Личок: {private_count}",
+        f"✉️ Сообщений: {totals['messages']}",
+        f"🔠 Символов: {totals['chars']}",
+        f"🎟 Стикеров: {totals['stickers']}",
+        f"🖼 Фото: {totals['photos']}",
+        f"🎬 Видео: {totals['videos']}",
+        f"🎤 Голосовых: {totals['voice']}",
+        f"🎞 GIF: {totals['gifs']}",
+        f"↩️ Пересланных: {totals['forwards']}",
+    ]
+
+    if top_rows:
+        lines.append("")
+        lines.append("<b>🏆 Топ-5 активных (беседы)</b>")
+        for i, row in enumerate(top_rows, start=1):
+            user_id, username, first_name, chat_title, \
+                messages, chars, stickers, photos, videos, voice, gifs, forwards = row
+
+            name = build_clickable_name(user_id, username, first_name)
+            chat_label = html.escape(chat_title or "Без названия")
+
+            extra_parts = []
+            if stickers:
+                extra_parts.append(f"стикеры {stickers}")
+            if photos:
+                extra_parts.append(f"фото {photos}")
+            if videos:
+                extra_parts.append(f"видео {videos}")
+            if voice:
+                extra_parts.append(f"голосовые {voice}")
+            if gifs:
+                extra_parts.append(f"gif {gifs}")
+            if forwards:
+                extra_parts.append(f"пересланных {forwards}")
+            extra = f" ({', '.join(extra_parts)})" if extra_parts else ""
+
+            lines.append(
+                f"{rank_label(i)} {name} — {chat_label}: "
+                f"{messages} сообщений, {chars} символов{extra}"
+            )
+
+    return "\n".join(lines)
+
+
 # =============================================================================
 #                          ХЕНДЛЕРЫ
 # =============================================================================
@@ -199,7 +273,9 @@ def register():
     """Регистрирует все хендлеры админ-команд."""
 
     @bot.message_handler(
-        func=lambda m: (m.text or "").strip().lower() == "адмхелп"
+        func=lambda m: m.chat.type == "private"
+        and m.from_user.id in ADMIN_IDS
+        and (m.text or "").strip().lower() == "адмхелп"
     )
     def handle_admin_help(message: types.Message):
         if not _is_admin_in_pm(message):
@@ -208,7 +284,9 @@ def register():
 
     # --- стата (без аргументов) ---
     @bot.message_handler(
-        func=lambda m: (m.text or "").strip().lower() in ("стата", "статистика")
+        func=lambda m: m.chat.type == "private"
+        and m.from_user.id in ADMIN_IDS
+        and (m.text or "").strip().lower() in ("стата", "статистика")
     )
     def handle_stats(message: types.Message):
         if not _is_admin_in_pm(message):
@@ -222,9 +300,9 @@ def register():
 
     # --- стата [чат] ---
     @bot.message_handler(
-        func=lambda m: bool(
-            (m.text or "").strip().lower().startswith(("стата ", "статистика "))
-        )
+        func=lambda m: m.chat.type == "private"
+        and m.from_user.id in ADMIN_IDS
+        and bool((m.text or "").strip().lower().startswith(("стата ", "статистика ")))
     )
     def handle_stats_chat(message: types.Message):
         if not _is_admin_in_pm(message):
@@ -285,7 +363,9 @@ def register():
 
     # --- топ вся ---
     @bot.message_handler(
-        func=lambda m: (m.text or "").strip().lower() == "топ вся"
+        func=lambda m: m.chat.type == "private"
+        and m.from_user.id in ADMIN_IDS
+        and (m.text or "").strip().lower() == "топ вся"
     )
     def handle_top_global(message: types.Message):
         if not _is_admin_in_pm(message):
@@ -304,7 +384,9 @@ def register():
 
     # --- топ беседы / топ чаты ---
     @bot.message_handler(
-        func=lambda m: (m.text or "").strip().lower() in ("топ беседы", "топ чаты")
+        func=lambda m: m.chat.type == "private"
+        and m.from_user.id in ADMIN_IDS
+        and (m.text or "").strip().lower() in ("топ беседы", "топ чаты")
     )
     def handle_top_chats(message: types.Message):
         if not _is_admin_in_pm(message):
@@ -323,7 +405,9 @@ def register():
 
     # --- топ [чат] ---
     @bot.message_handler(
-        func=lambda m: bool(
+        func=lambda m: m.chat.type == "private"
+        and m.from_user.id in ADMIN_IDS
+        and bool(
             (m.text or "").strip().lower().startswith("топ ")
             and (m.text or "").strip().lower() not in ("топ вся", "топ беседы", "топ чаты")
         )
@@ -379,7 +463,9 @@ def register():
 
     # --- юзер [id/@username] ---
     @bot.message_handler(
-        func=lambda m: bool((m.text or "").strip().lower().startswith("юзер "))
+        func=lambda m: m.chat.type == "private"
+        and m.from_user.id in ADMIN_IDS
+        and bool((m.text or "").strip().lower().startswith("юзер "))
     )
     def handle_user_stats(message: types.Message):
         if not _is_admin_in_pm(message):

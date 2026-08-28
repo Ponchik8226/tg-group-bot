@@ -58,3 +58,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("timer_bot")
+
+if not WEBHOOK_SECRET:
+    logger.warning(
+        "WEBHOOK_SECRET не задан — webhook-эндпоинт не защищён "
+        "от поддельных запросов. Задайте случайную строку "
+        "в переменной окружения WEBHOOK_SECRET."
+    )
