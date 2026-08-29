@@ -1,15 +1,13 @@
 """
-Админ-команды бота. Все команды работают ТОЛЬКО в личке бота
-и ТОЛЬКО для пользователей из ADMIN_IDS.
+Админ-команды бота. Работают ТОЛЬКО в личке и ТОЛЬКО для ADMIN_IDS.
 
-Команды:
-  адмхелп                      — список всех админ-команд
-  стата / статистика            — общая статистика бота
-  стата [название/id]           — статистика конкретной беседы
-  топ вся                       — глобальный топ по всем чатам (пагинация ◀️▶️)
-  топ [название/id]             — топ пользователей в конкретном чате (пагинация ◀️▶️)
-  топ беседы / топ чаты         — топ бесед по активности (пагинация ◀️▶️)
-  юзер [id/@username]           — детальная статистика пользователя
+  адмхелп                — список команд
+  стата / статистика      — общая статистика
+  стата [название/id]     — статистика беседы
+  топ вся                 — глобальный топ (пагинация)
+  топ [название/id]       — топ пользователей чата
+  топ беседы / топ чаты   — топ бесед
+  юзер [id/@username]     — статистика пользователя
 """
 
 import html
@@ -19,84 +17,74 @@ from telebot import types
 
 import database
 from config import bot, ADMIN_IDS, logger
-from utils import split_message, build_clickable_name, rank_label
+from utils import (
+    BoundedDict,
+    build_clickable_name,
+    rank_label,
+    safe_answer_callback,
+    safe_edit,
+    safe_reply,
+    safe_send,
+)
+
+PAGE_SIZE = 10
+
+_pagination: BoundedDict = BoundedDict(500)
 
 
 # =============================================================================
 #                          ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =============================================================================
 
-PAGE_SIZE = 10
-
-
-def _is_admin_in_pm(message: types.Message) -> bool:
-    """Возвращает True если сообщение из лички и отправитель — админ."""
-    return (
-        message.chat.type == "private"
-        and message.from_user.id in ADMIN_IDS
-    )
-
-
-def _fmt_user(user_id: int, username, first_name) -> str:
-    """Кликабельное имя пользователя через build_clickable_name из utils."""
-    return build_clickable_name(user_id, username, first_name)
+def _is_admin_pm(m: types.Message) -> bool:
+    return (m.chat.type == "private"
+            and m.from_user is not None
+            and m.from_user.id in ADMIN_IDS)
 
 
 def _fmt_row_stats(messages, chars, stickers, photos, videos, voice, gifs, forwards) -> str:
-    """Форматирует счётчики в читаемую строку без странных точек-запятых."""
     parts = [f"{messages} сообщений", f"{chars} символов"]
-    if stickers:
-        parts.append(f"стикеров {stickers}")
-    if photos:
-        parts.append(f"фото {photos}")
-    if videos:
-        parts.append(f"видео {videos}")
-    if voice:
-        parts.append(f"голосовых {voice}")
-    if gifs:
-        parts.append(f"gif {gifs}")
-    if forwards:
-        parts.append(f"пересланных {forwards}")
+    for value, label in ((stickers, "стикеров"), (photos, "фото"), (videos, "видео"),
+                         (voice, "голосовых"), (gifs, "gif"), (forwards, "пересланных")):
+        if value:
+            parts.append(f"{label} {value}")
     return ", ".join(parts)
-
-
-# =============================================================================
-#                          СОСТОЯНИЕ ПАГИНАЦИИ (в памяти)
-# =============================================================================
-
-# {user_id: {"mode": "global"|"chat"|"chats_top", "chat_id": int|None,
-#             "chat_title": str, "page": int, "total": int}}
-
-
-class _BoundedDict(dict):
-    """Dict с ограничением размера — при переполнении удаляет самые старые записи."""
-
-    __slots__ = ("_maxsize",)
-
-    def __init__(self, maxsize: int = 500):
-        super().__init__()
-        self._maxsize = maxsize
-
-    def __setitem__(self, key, value):
-        if key not in self and len(self) >= self._maxsize:
-            oldest = next(iter(self))
-            del self[oldest]
-        super().__setitem__(key, value)
-
-
-_pagination: _BoundedDict = _BoundedDict(500)
 
 
 def _total_pages(total: int) -> int:
     return max(1, math.ceil(total / PAGE_SIZE))
 
 
-def _get_page(user_id: int, direction: int) -> int:
-    """Кольцевая навигация: +1 вперёд, -1 назад."""
+def _nav_keyboard(prefix: str, page: int, pages: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("◀️", callback_data=f"{prefix}_prev"),
+        types.InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="top_noop"),
+        types.InlineKeyboardButton("▶️", callback_data=f"{prefix}_next"),
+    )
+    return kb
+
+
+def _shift_page(user_id: int, direction: int) -> int:
     state = _pagination.get(user_id, {})
-    current = state.get("page", 0)
-    total = _total_pages(state.get("total", 0))
-    return (current + direction) % total
+    return (state.get("page", 0) + direction) % _total_pages(state.get("total", 0))
+
+
+def admin_handler(fn):
+    """Проверка прав + защита от необработанных исключений."""
+    def wrapper(message: types.Message):
+        if not _is_admin_pm(message):
+            return
+        if not database.db_enabled():
+            safe_reply(message, "⚠️ База данных не настроена.")
+            return
+        try:
+            fn(message)
+        except Exception:
+            logger.exception("Ошибка в админ-хендлере %s", fn.__name__)
+            safe_reply(message, "⚠️ Ошибка при выполнении команды.")
+    wrapper.__name__ = fn.__name__
+    return wrapper
 
 
 # =============================================================================
@@ -104,121 +92,85 @@ def _get_page(user_id: int, direction: int) -> int:
 # =============================================================================
 
 def _build_global_page(page: int):
-    """Страница глобального топа. Возвращает (text, keyboard, total)."""
-    offset = page * PAGE_SIZE
-    rows, total = database.get_global_top_page(offset, PAGE_SIZE)
+    rows, total = database.get_global_top_page(page * PAGE_SIZE, PAGE_SIZE)
     pages = _total_pages(total)
 
     lines = [f"<b>🌍 Глобальный топ — стр. {page + 1}/{pages}</b>", ""]
-    for i, row in enumerate(rows, start=offset + 1):
-        user_id, username, first_name, chat_title = row[0], row[1], row[2], row[3]
-        stats = row[4:]
-        name = _fmt_user(user_id, username, first_name)
-        chat = html.escape(chat_title or "?")
-        lines.append(f"{rank_label(i)} {name} ({chat}) — {_fmt_row_stats(*stats)}")
-
+    for i, row in enumerate(rows, start=page * PAGE_SIZE + 1):
+        name = build_clickable_name(row[0], row[1], row[2])
+        lines.append(f"{rank_label(i)} {name} ({html.escape(row[3] or '?')}) "
+                     f"— {_fmt_row_stats(*row[4:])}")
     if not rows:
         lines.append("Нет данных.")
 
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(
-        types.InlineKeyboardButton("◀️", callback_data="top_global_prev"),
-        types.InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="top_noop"),
-        types.InlineKeyboardButton("▶️", callback_data="top_global_next"),
-    )
-    return "\n".join(lines), keyboard, total
+    return "\n".join(lines), _nav_keyboard("top_global", page, pages), total
 
 
 def _build_chat_page(chat_id: int, chat_title: str, page: int):
-    """Страница топа по конкретному чату. Возвращает (text, keyboard, total)."""
-    offset = page * PAGE_SIZE
-    rows, total = database.get_chat_top_page(chat_id, offset, PAGE_SIZE)
+    rows, total = database.get_chat_top_page(chat_id, page * PAGE_SIZE, PAGE_SIZE)
     pages = _total_pages(total)
 
-    title_escaped = html.escape(chat_title or str(chat_id))
-    lines = [f"<b>💬 Топ «{title_escaped}» — стр. {page + 1}/{pages}</b>", ""]
-    for i, row in enumerate(rows, start=offset + 1):
-        user_id, username, first_name = row[0], row[1], row[2]
-        stats = row[3:]
-        name = _fmt_user(user_id, username, first_name)
-        lines.append(f"{rank_label(i)} {name} — {_fmt_row_stats(*stats)}")
-
+    lines = [f"<b>💬 Топ «{html.escape(chat_title or str(chat_id))}» "
+             f"— стр. {page + 1}/{pages}</b>", ""]
+    for i, row in enumerate(rows, start=page * PAGE_SIZE + 1):
+        name = build_clickable_name(row[0], row[1], row[2])
+        lines.append(f"{rank_label(i)} {name} — {_fmt_row_stats(*row[3:])}")
     if not rows:
         lines.append("Нет данных.")
 
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(
-        types.InlineKeyboardButton("◀️", callback_data="top_chat_prev"),
-        types.InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="top_noop"),
-        types.InlineKeyboardButton("▶️", callback_data="top_chat_next"),
-    )
-    return "\n".join(lines), keyboard, total
+    return "\n".join(lines), _nav_keyboard("top_chat", page, pages), total
 
 
 def _build_chats_top_page(page: int):
-    """Страница топа бесед. Возвращает (text, keyboard, total)."""
-    offset = page * PAGE_SIZE
-    rows, total = database.get_chats_top_page(offset, PAGE_SIZE)
+    rows, total = database.get_chats_top_page(page * PAGE_SIZE, PAGE_SIZE)
     pages = _total_pages(total)
 
     lines = [f"<b>🏆 Топ бесед — стр. {page + 1}/{pages}</b>", ""]
-    for i, row in enumerate(rows, start=offset + 1):
-        _, title, messages, chars, stickers, photos, videos, voice, gifs, forwards = row
-        title_e = html.escape(title or "Без названия")
-        stats = _fmt_row_stats(messages, chars, stickers, photos, videos, voice, gifs, forwards)
-        lines.append(f"{rank_label(i)} {title_e} — {stats}")
-
+    for i, row in enumerate(rows, start=page * PAGE_SIZE + 1):
+        lines.append(f"{rank_label(i)} {html.escape(row[1] or 'Без названия')} "
+                     f"— {_fmt_row_stats(*row[2:])}")
     if not rows:
         lines.append("Нет данных.")
 
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(
-        types.InlineKeyboardButton("◀️", callback_data="top_chats_prev"),
-        types.InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="top_noop"),
-        types.InlineKeyboardButton("▶️", callback_data="top_chats_next"),
-    )
-    return "\n".join(lines), keyboard, total
+    return "\n".join(lines), _nav_keyboard("top_chats", page, pages), total
 
 
-# =============================================================================
-#                          ТЕКСТЫ
-# =============================================================================
+def _build_chat_stats_text(chat_id: int, chat_title: str) -> str:
+    row = database.get_chat_stats(chat_id)
+    title_e = html.escape(chat_title or str(chat_id))
+    if not row:
+        return f"❌ Нет данных по чату «{title_e}»."
 
-ADMIN_HELP_TEXT = (
-    "<b>🔐 Команды для админа</b>\n\n"
-    "Все команды работают только в личке бота.\n\n"
+    participants, messages, chars, stickers, photos, videos, voice, gifs, forwards = row
+    lines = [
+        f"<b>📊 Статистика «{title_e}»</b>", "",
+        f"👥 Участников в боте: {participants}",
+        f"✉️ Сообщений: {messages}",
+        f"🔠 Символов: {chars}",
+        f"🎟 Стикеров: {stickers}",
+        f"🖼 Фото: {photos}",
+        f"🎬 Видео: {videos}",
+        f"🎤 Голосовых: {voice}",
+        f"🎞 GIF: {gifs}",
+        f"↩️ Пересланных: {forwards}",
+    ]
 
-    "<b>стата</b> — общая статистика бота\n\n"
+    top_rows, _ = database.get_chat_top_page(chat_id, 0, 5)
+    if top_rows:
+        lines += ["", "<b>🏆 Топ-5 участников</b>"]
+        for i, top_row in enumerate(top_rows, start=1):
+            name = build_clickable_name(top_row[0], top_row[1], top_row[2])
+            lines.append(f"{rank_label(i)} {name} — {_fmt_row_stats(*top_row[3:])}")
 
-    "<b>стата [название или ID чата]</b> — статистика конкретной беседы\n"
-    "  Примеры: <code>стата Мой чат</code>, <code>стата -1001234567890</code>\n\n"
-
-    "<b>топ вся</b> — глобальный топ по всем чатам\n"
-    "  листается кнопками ◀️ ▶️\n\n"
-
-    "<b>топ [название или ID чата]</b> — топ пользователей в конкретном чате\n"
-    "  Примеры: <code>топ Мой чат</code>, <code>топ -1001234567890</code>\n\n"
-
-    "<b>топ беседы</b> / <b>топ чаты</b> — топ бесед по активности (без ЛС)\n"
-    "  листается кнопками ◀️ ▶️\n\n"
-
-    "<b>юзер [ID или @username]</b> — детальная статистика пользователя\n"
-    "  Примеры: <code>юзер 123456789</code>, <code>юзер @nickname</code>\n\n"
-
-    "<b>адмхелп</b> — это сообщение"
-)
-
+    return "\n".join(lines)
 
 
 def build_stats_report() -> str:
-    """Формирует текст отчёта /стата: сводка + топ-5 по активности (только из бесед)."""
     total_users, _, totals = database.get_stats_overview()
     group_count, private_count = database.get_chats_count_by_type()
-    top_rows = database.get_top_activity_groups(limit=5)
 
     lines = [
-        "<b>📊 Общая статистика</b>",
-        "",
+        "<b>📊 Общая статистика</b>", "",
         f"👤 Пользователей: {total_users}",
         f"💬 Бесед: {group_count}",
         f"📩 Личок: {private_count}",
@@ -232,37 +184,29 @@ def build_stats_report() -> str:
         f"↩️ Пересланных: {totals['forwards']}",
     ]
 
+    top_rows = database.get_top_activity_groups(limit=5)
     if top_rows:
-        lines.append("")
-        lines.append("<b>🏆 Топ-5 активных (беседы)</b>")
+        lines += ["", "<b>🏆 Топ-5 активных (беседы)</b>"]
         for i, row in enumerate(top_rows, start=1):
-            user_id, username, first_name, chat_title, \
-                messages, chars, stickers, photos, videos, voice, gifs, forwards = row
-
-            name = build_clickable_name(user_id, username, first_name)
-            chat_label = html.escape(chat_title or "Без названия")
-
-            extra_parts = []
-            if stickers:
-                extra_parts.append(f"стикеры {stickers}")
-            if photos:
-                extra_parts.append(f"фото {photos}")
-            if videos:
-                extra_parts.append(f"видео {videos}")
-            if voice:
-                extra_parts.append(f"голосовые {voice}")
-            if gifs:
-                extra_parts.append(f"gif {gifs}")
-            if forwards:
-                extra_parts.append(f"пересланных {forwards}")
-            extra = f" ({', '.join(extra_parts)})" if extra_parts else ""
-
-            lines.append(
-                f"{rank_label(i)} {name} — {chat_label}: "
-                f"{messages} сообщений, {chars} символов{extra}"
-            )
+            name = build_clickable_name(row[0], row[1], row[2])
+            lines.append(f"{rank_label(i)} {name} — {html.escape(row[3] or 'Без названия')}: "
+                         f"{_fmt_row_stats(*row[4:])}")
 
     return "\n".join(lines)
+
+
+ADMIN_HELP_TEXT = (
+    "<b>🔐 Команды для админа</b>\n\n"
+    "Все команды работают только в личке бота.\n\n"
+    "<b>стата</b> — общая статистика бота\n\n"
+    "<b>стата [название или ID чата]</b> — статистика беседы\n"
+    "  <code>стата Мой чат</code>, <code>стата -1001234567890</code>\n\n"
+    "<b>топ вся</b> — глобальный топ по всем чатам (◀️ ▶️)\n\n"
+    "<b>топ [название или ID чата]</b> — топ пользователей чата\n\n"
+    "<b>топ беседы</b> / <b>топ чаты</b> — топ бесед (◀️ ▶️)\n\n"
+    "<b>юзер [ID или @username]</b> — статистика пользователя\n\n"
+    "<b>адмхелп</b> — это сообщение"
+)
 
 
 # =============================================================================
@@ -270,238 +214,118 @@ def build_stats_report() -> str:
 # =============================================================================
 
 def register():
-    """Регистрирует все хендлеры админ-команд."""
-
-    @bot.message_handler(
-        func=lambda m: m.chat.type == "private"
-        and m.from_user.id in ADMIN_IDS
-        and (m.text or "").strip().lower() == "адмхелп"
-    )
-    def handle_admin_help(message: types.Message):
-        if not _is_admin_in_pm(message):
-            return
-        bot.send_message(message.chat.id, ADMIN_HELP_TEXT)
-
-    # --- стата (без аргументов) ---
-    @bot.message_handler(
-        func=lambda m: m.chat.type == "private"
-        and m.from_user.id in ADMIN_IDS
-        and (m.text or "").strip().lower() in ("стата", "статистика")
-    )
-    def handle_stats(message: types.Message):
-        if not _is_admin_in_pm(message):
-            return
-        if not database.db_enabled():
-            bot.reply_to(message, "⚠️ База данных не настроена.")
-            return
-        report = build_stats_report()
-        for chunk in split_message(report):
-            bot.send_message(message.chat.id, chunk)
-
-    # --- стата [чат] ---
-    @bot.message_handler(
-        func=lambda m: m.chat.type == "private"
-        and m.from_user.id in ADMIN_IDS
-        and bool((m.text or "").strip().lower().startswith(("стата ", "статистика ")))
-    )
-    def handle_stats_chat(message: types.Message):
-        if not _is_admin_in_pm(message):
-            return
-        if not database.db_enabled():
-            bot.reply_to(message, "⚠️ База данных не настроена.")
-            return
-
-        # Убираем команду, берём аргумент
-        text = message.text.strip()
-        if text.lower().startswith("статистика "):
-            query = text[11:].strip()
-        else:
-            query = text[6:].strip()
-
-        if not query:
-            bot.reply_to(
-                message,
-                "Укажите название или ID чата.\n"
-                "Пример: <code>стата Мой чат</code>",
-            )
-            return
-
-        # Ищем чат
+    def _find_chats(query: str):
         if query.lstrip("-").isdigit():
             chat = database.get_chat_by_id(int(query))
-            if not chat:
-                bot.reply_to(message, f"❌ Чат с ID <code>{query}</code> не найден.")
-                return
-            chats = [chat]
-        else:
-            chats = database.find_chats_by_name(query)
-            if not chats:
-                bot.reply_to(message, f"❌ Чаты с названием «{html.escape(query)}» не найдены.")
-                return
+            return [chat] if chat else []
+        return database.find_chats_by_name(query)
 
-        if len(chats) == 1:
-            chat_id, chat_title, _ = chats[0]
-            _send_chat_stats(message.chat.id, chat_id, chat_title)
-            return
-
-        # Несколько совпадений — предлагаем выбор
+    def _ask_which_chat(message, chats, query, cb_prefix):
         lines = [f"Найдено несколько чатов по запросу «{html.escape(query)}»:\n"]
         keyboard = types.InlineKeyboardMarkup()
         for chat_id, chat_title, _ in chats:
-            label = html.escape(chat_title or str(chat_id))
-            lines.append(f"• {label}")
-            keyboard.add(
-                types.InlineKeyboardButton(
-                    label, callback_data=f"stats_select_{chat_id}"
-                )
-            )
-        bot.send_message(
-            message.chat.id,
-            "\n".join(lines) + "\n\nВыберите чат:",
-            reply_markup=keyboard,
-        )
+            title = chat_title or str(chat_id)
+            lines.append(f"• {html.escape(title)}")
+            # Подпись кнопки — не HTML, экранировать её нельзя
+            keyboard.add(types.InlineKeyboardButton(
+                title[:64], callback_data=f"{cb_prefix}{chat_id}"))
+        safe_reply(message, "\n".join(lines) + "\n\nВыберите чат:", reply_markup=keyboard)
 
-    # --- топ вся ---
-    @bot.message_handler(
-        func=lambda m: m.chat.type == "private"
-        and m.from_user.id in ADMIN_IDS
-        and (m.text or "").strip().lower() == "топ вся"
-    )
-    def handle_top_global(message: types.Message):
-        if not _is_admin_in_pm(message):
-            return
-        if not database.db_enabled():
-            bot.reply_to(message, "⚠️ База данных не настроена.")
-            return
-        page = 0
-        text, keyboard, total = _build_global_page(page)
-        sent = bot.send_message(message.chat.id, text, reply_markup=keyboard)
-        _pagination[message.from_user.id] = {
-            "mode": "global", "chat_id": None,
-            "chat_title": "", "page": page, "total": total,
-            "message_id": sent.message_id,
-        }
+    @bot.message_handler(func=lambda m: _is_admin_pm(m)
+                         and (m.text or "").strip().lower() == "адмхелп")
+    @admin_handler
+    def handle_admin_help(message):
+        safe_reply(message, ADMIN_HELP_TEXT)
 
-    # --- топ беседы / топ чаты ---
-    @bot.message_handler(
-        func=lambda m: m.chat.type == "private"
-        and m.from_user.id in ADMIN_IDS
-        and (m.text or "").strip().lower() in ("топ беседы", "топ чаты")
-    )
-    def handle_top_chats(message: types.Message):
-        if not _is_admin_in_pm(message):
-            return
-        if not database.db_enabled():
-            bot.reply_to(message, "⚠️ База данных не настроена.")
-            return
-        page = 0
-        text, keyboard, total = _build_chats_top_page(page)
-        sent = bot.send_message(message.chat.id, text, reply_markup=keyboard)
-        _pagination[message.from_user.id] = {
-            "mode": "chats_top", "chat_id": None,
-            "chat_title": "", "page": page, "total": total,
-            "message_id": sent.message_id,
-        }
+    @bot.message_handler(func=lambda m: _is_admin_pm(m)
+                         and (m.text or "").strip().lower() in ("стата", "статистика"))
+    @admin_handler
+    def handle_stats(message):
+        safe_reply(message, build_stats_report())
 
-    # --- топ [чат] ---
-    @bot.message_handler(
-        func=lambda m: m.chat.type == "private"
-        and m.from_user.id in ADMIN_IDS
-        and bool(
-            (m.text or "").strip().lower().startswith("топ ")
-            and (m.text or "").strip().lower() not in ("топ вся", "топ беседы", "топ чаты")
-        )
-    )
-    def handle_top_chat(message: types.Message):
-        if not _is_admin_in_pm(message):
-            return
-        if not database.db_enabled():
-            bot.reply_to(message, "⚠️ База данных не настроена.")
+    @bot.message_handler(func=lambda m: _is_admin_pm(m)
+                         and (m.text or "").strip().lower().startswith(("стата ", "статистика ")))
+    @admin_handler
+    def handle_stats_chat(message):
+        text = message.text.strip()
+        query = text.split(maxsplit=1)[1].strip()
+        if not query:
+            safe_reply(message, "Укажите название или ID чата.")
             return
 
+        chats = _find_chats(query)
+        if not chats:
+            safe_reply(message, f"❌ Чат «{html.escape(query)}» не найден.")
+        elif len(chats) == 1:
+            safe_reply(message, _build_chat_stats_text(chats[0][0], chats[0][1]))
+        else:
+            _ask_which_chat(message, chats, query, "stats_select_")
+
+    @bot.message_handler(func=lambda m: _is_admin_pm(m)
+                         and (m.text or "").strip().lower() == "топ вся")
+    @admin_handler
+    def handle_top_global(message):
+        text, keyboard, total = _build_global_page(0)
+        sent = safe_send(message.chat.id, text, reply_markup=keyboard)
+        if sent:
+            _pagination[message.from_user.id] = {
+                "mode": "global", "chat_id": None, "chat_title": "",
+                "page": 0, "total": total, "message_id": sent.message_id,
+            }
+
+    @bot.message_handler(func=lambda m: _is_admin_pm(m)
+                         and (m.text or "").strip().lower() in ("топ беседы", "топ чаты"))
+    @admin_handler
+    def handle_top_chats(message):
+        text, keyboard, total = _build_chats_top_page(0)
+        sent = safe_send(message.chat.id, text, reply_markup=keyboard)
+        if sent:
+            _pagination[message.from_user.id] = {
+                "mode": "chats_top", "chat_id": None, "chat_title": "",
+                "page": 0, "total": total, "message_id": sent.message_id,
+            }
+
+    @bot.message_handler(func=lambda m: _is_admin_pm(m)
+                         and (m.text or "").strip().lower().startswith("топ ")
+                         and (m.text or "").strip().lower()
+                         not in ("топ вся", "топ беседы", "топ чаты"))
+    @admin_handler
+    def handle_top_chat(message):
         query = message.text.strip()[4:].strip()
         if not query:
-            bot.reply_to(
-                message,
-                "Укажите название или ID чата.\n"
-                "Пример: <code>топ Мой чат</code>",
-            )
+            safe_reply(message, "Укажите название или ID чата.")
             return
 
-        if query.lstrip("-").isdigit():
-            chat = database.get_chat_by_id(int(query))
-            if not chat:
-                bot.reply_to(message, f"❌ Чат с ID <code>{query}</code> не найден.")
-                return
-            chats = [chat]
+        chats = _find_chats(query)
+        if not chats:
+            safe_reply(message, f"❌ Чат «{html.escape(query)}» не найден.")
+        elif len(chats) == 1:
+            _send_chat_top(message.chat.id, message.from_user.id, chats[0][0], chats[0][1])
         else:
-            chats = database.find_chats_by_name(query)
-            if not chats:
-                bot.reply_to(message, f"❌ Чаты с названием «{html.escape(query)}» не найдены.")
-                return
+            _ask_which_chat(message, chats, query, "top_select_")
 
-        if len(chats) == 1:
-            chat_id, chat_title, _ = chats[0]
-            _send_chat_top(message.chat.id, message.from_user.id, chat_id, chat_title)
-            return
-
-        lines = [f"Найдено несколько чатов по запросу «{html.escape(query)}»:\n"]
-        keyboard = types.InlineKeyboardMarkup()
-        for chat_id, chat_title, _ in chats:
-            label = html.escape(chat_title or str(chat_id))
-            lines.append(f"• {label}")
-            keyboard.add(
-                types.InlineKeyboardButton(
-                    label, callback_data=f"top_select_{chat_id}"
-                )
-            )
-        bot.send_message(
-            message.chat.id,
-            "\n".join(lines) + "\n\nВыберите чат:",
-            reply_markup=keyboard,
-        )
-
-    # --- юзер [id/@username] ---
-    @bot.message_handler(
-        func=lambda m: m.chat.type == "private"
-        and m.from_user.id in ADMIN_IDS
-        and bool((m.text or "").strip().lower().startswith("юзер "))
-    )
-    def handle_user_stats(message: types.Message):
-        if not _is_admin_in_pm(message):
-            return
-        if not database.db_enabled():
-            bot.reply_to(message, "⚠️ База данных не настроена.")
-            return
-
+    @bot.message_handler(func=lambda m: _is_admin_pm(m)
+                         and (m.text or "").strip().lower().startswith("юзер "))
+    @admin_handler
+    def handle_user_stats(message):
         query = message.text.strip()[5:].strip()
         if not query:
-            bot.reply_to(
-                message,
-                "Укажите ID или @username.\n"
-                "Примеры: <code>юзер 123456789</code>, <code>юзер @nickname</code>",
-            )
+            safe_reply(message, "Укажите ID или @username.")
             return
 
-        if query.lstrip("-").isdigit():
-            user_row = database.get_user_by_id(int(query))
-        else:
-            user_row = database.get_user_by_username(query.lstrip("@"))
-
+        user_row = (database.get_user_by_id(int(query))
+                    if query.lstrip("-").isdigit()
+                    else database.get_user_by_username(query.lstrip("@")))
         if not user_row:
-            bot.reply_to(message, f"❌ Пользователь «{html.escape(query)}» не найден в базе.")
+            safe_reply(message, f"❌ Пользователь «{html.escape(query)}» не найден.")
             return
 
         user_id, username, first_name, last_name, registered_at, last_seen_at = user_row
         chat_stats = database.get_user_stats_all_chats(user_id)
-
-        display = build_clickable_name(user_id, username, first_name)
-        full_name_parts = [first_name or "", last_name or ""]
-        full_name = html.escape(" ".join(p for p in full_name_parts if p).strip() or "—")
+        full_name = html.escape(" ".join(p for p in (first_name or "", last_name or "") if p) or "—")
 
         lines = [
-            f"<b>👤 Пользователь: {display}</b>",
-            "",
+            f"<b>👤 Пользователь: {build_clickable_name(user_id, username, first_name)}</b>", "",
             f"🆔 ID: <code>{user_id}</code>",
             f"📛 Имя: {full_name}",
             f"🔖 Username: @{html.escape(username)}" if username else "🔖 Username: —",
@@ -510,182 +334,101 @@ def register():
         ]
 
         if chat_stats:
-            total_msgs = sum(r[1] for r in chat_stats)
-            total_chars = sum(r[2] for r in chat_stats)
             lines += [
-                "",
-                "<b>📊 Итого по всем чатам:</b>",
-                f"✉️ Сообщений: {total_msgs}",
-                f"🔠 Символов: {total_chars}",
-                "",
-                "<b>📋 По чатам:</b>",
+                "", "<b>📊 Итого по всем чатам:</b>",
+                f"✉️ Сообщений: {sum(r[1] for r in chat_stats)}",
+                f"🔠 Символов: {sum(r[2] for r in chat_stats)}",
+                "", "<b>📋 По чатам:</b>",
             ]
             for row in chat_stats:
-                chat_title = html.escape(row[0] or "?")
-                stats_str = _fmt_row_stats(*row[1:])
-                lines.append(f"• {chat_title}: {stats_str}")
+                lines.append(f"• {html.escape(row[0] or '?')}: {_fmt_row_stats(*row[1:])}")
         else:
             lines.append("\nСтатистика не найдена.")
 
-        for chunk in split_message("\n".join(lines)):
-            bot.send_message(message.chat.id, chunk)
+        safe_send(message.chat.id, "\n".join(lines))
 
-    # --- Callback-хендлеры для пагинации ---
+    # --- Пагинация ---
 
-    @bot.callback_query_handler(func=lambda c: c.data and (c.data.startswith("top_") or c.data.startswith("stats_")))
+    @bot.callback_query_handler(
+        func=lambda c: (c.data or "").startswith(("top_", "stats_")))
     def handle_callbacks(call: types.CallbackQuery):
+        # Защита в глубину: кнопки живут только в личке админа,
+        # но проверить права всё равно стоит.
+        if call.from_user.id not in ADMIN_IDS:
+            safe_answer_callback(call.id, "⛔ Недостаточно прав.")
+            return
+        try:
+            _dispatch_callback(call)
+        except Exception:
+            logger.exception("Ошибка в админ-callback.")
+            safe_answer_callback(call.id, "⚠️ Ошибка.")
+
+    def _dispatch_callback(call: types.CallbackQuery):
         user_id = call.from_user.id
+        data = call.data
 
-        if call.data == "top_noop":
-            bot.answer_callback_query(call.id)
+        if data == "top_noop":
+            safe_answer_callback(call.id)
             return
 
-        # Выбор чата для стата [чат]
-        if call.data.startswith("stats_select_"):
-            chat_id = int(call.data.replace("stats_select_", ""))
-            chat = database.get_chat_by_id(chat_id)
+        if data.startswith("stats_select_"):
+            chat = database.get_chat_by_id(int(data.replace("stats_select_", "")))
             if not chat:
-                bot.answer_callback_query(call.id, "Чат не найден.")
+                safe_answer_callback(call.id, "Чат не найден.")
                 return
-            _, chat_title, _ = chat
-            bot.edit_message_text(
-                _build_chat_stats_text(chat_id, chat_title),
-                call.message.chat.id,
-                call.message.message_id,
-            )
-            bot.answer_callback_query(call.id)
+            safe_edit(_build_chat_stats_text(chat[0], chat[1]),
+                      call.message.chat.id, call.message.message_id)
+            safe_answer_callback(call.id)
             return
 
-        # Выбор чата для топ [чат]
-        if call.data.startswith("top_select_"):
-            chat_id = int(call.data.replace("top_select_", ""))
-            chat = database.get_chat_by_id(chat_id)
+        if data.startswith("top_select_"):
+            chat = database.get_chat_by_id(int(data.replace("top_select_", "")))
             if not chat:
-                bot.answer_callback_query(call.id, "Чат не найден.")
+                safe_answer_callback(call.id, "Чат не найден.")
                 return
-            _, chat_title, _ = chat
-            page = 0
-            text, keyboard, total = _build_chat_page(chat_id, chat_title, page)
+            text, keyboard, total = _build_chat_page(chat[0], chat[1], 0)
             _pagination[user_id] = {
-                "mode": "chat", "chat_id": chat_id,
-                "chat_title": chat_title, "page": page, "total": total,
-                "message_id": call.message.message_id,
+                "mode": "chat", "chat_id": chat[0], "chat_title": chat[1],
+                "page": 0, "total": total, "message_id": call.message.message_id,
             }
-            bot.edit_message_text(
-                text, call.message.chat.id, call.message.message_id,
-                reply_markup=keyboard,
-            )
-            bot.answer_callback_query(call.id)
+            safe_edit(text, call.message.chat.id, call.message.message_id,
+                      reply_markup=keyboard)
+            safe_answer_callback(call.id)
             return
 
-        # Глобальный топ
-        if call.data in ("top_global_prev", "top_global_next"):
-            state = _pagination.get(user_id)
-            if not state or state.get("mode") != "global" \
-                    or state.get("message_id") != call.message.message_id:
-                bot.answer_callback_query(call.id, "Начните заново: напишите «топ вся»")
-                return
-            direction = 1 if call.data == "top_global_next" else -1
-            page = _get_page(user_id, direction)
-            text, keyboard, total = _build_global_page(page)
-            state["page"] = page
-            state["total"] = total
-            bot.edit_message_text(
-                text, call.message.chat.id, call.message.message_id,
-                reply_markup=keyboard,
-            )
-            bot.answer_callback_query(call.id)
-            return
-
-        # Топ по чату
-        if call.data in ("top_chat_prev", "top_chat_next"):
-            state = _pagination.get(user_id)
-            if not state or state.get("mode") != "chat" \
-                    or state.get("message_id") != call.message.message_id:
-                bot.answer_callback_query(call.id, "Начните заново: напишите «топ [чат]»")
-                return
-            direction = 1 if call.data == "top_chat_next" else -1
-            page = _get_page(user_id, direction)
-            chat_id = state["chat_id"]
-            chat_title = state["chat_title"]
-            text, keyboard, total = _build_chat_page(chat_id, chat_title, page)
-            state["page"] = page
-            state["total"] = total
-            bot.edit_message_text(
-                text, call.message.chat.id, call.message.message_id,
-                reply_markup=keyboard,
-            )
-            bot.answer_callback_query(call.id)
-            return
-
-        # Топ бесед
-        if call.data in ("top_chats_prev", "top_chats_next"):
-            state = _pagination.get(user_id)
-            if not state or state.get("mode") != "chats_top" \
-                    or state.get("message_id") != call.message.message_id:
-                bot.answer_callback_query(call.id, "Начните заново: напишите «топ беседы»")
-                return
-            direction = 1 if call.data == "top_chats_next" else -1
-            page = _get_page(user_id, direction)
-            text, keyboard, total = _build_chats_top_page(page)
-            state["page"] = page
-            state["total"] = total
-            bot.edit_message_text(
-                text, call.message.chat.id, call.message.message_id,
-                reply_markup=keyboard,
-            )
-            bot.answer_callback_query(call.id)
-            return
-
-    # --- Вспомогательные функции (определены внутри register чтобы видеть bot) ---
-
-    def _send_chat_top(chat_id_to_send: int, user_id: int, chat_id: int, chat_title: str):
-        page = 0
-        text, keyboard, total = _build_chat_page(chat_id, chat_title, page)
-        sent = bot.send_message(chat_id_to_send, text, reply_markup=keyboard)
-        _pagination[user_id] = {
-            "mode": "chat", "chat_id": chat_id,
-            "chat_title": chat_title, "page": page, "total": total,
-            "message_id": sent.message_id,
+        modes = {
+            "top_global": ("global", "«топ вся»"),
+            "top_chat":   ("chat",   "«топ [чат]»"),
+            "top_chats":  ("chats_top", "«топ беседы»"),
         }
+        for prefix, (mode, hint) in modes.items():
+            if data in (f"{prefix}_prev", f"{prefix}_next"):
+                state = _pagination.get(user_id)
+                if (not state or state.get("mode") != mode
+                        or state.get("message_id") != call.message.message_id):
+                    safe_answer_callback(call.id, f"Начните заново: напишите {hint}")
+                    return
 
-    def _send_chat_stats(chat_id_to_send: int, chat_id: int, chat_title: str):
-        text = _build_chat_stats_text(chat_id, chat_title)
-        bot.send_message(chat_id_to_send, text)
+                page = _shift_page(user_id, 1 if data.endswith("_next") else -1)
+                if mode == "global":
+                    text, keyboard, total = _build_global_page(page)
+                elif mode == "chats_top":
+                    text, keyboard, total = _build_chats_top_page(page)
+                else:
+                    text, keyboard, total = _build_chat_page(
+                        state["chat_id"], state["chat_title"], page)
 
+                state["page"], state["total"] = page, total
+                safe_edit(text, call.message.chat.id, call.message.message_id,
+                          reply_markup=keyboard)
+                safe_answer_callback(call.id)
+                return
 
-def _build_chat_stats_text(chat_id: int, chat_title: str) -> str:
-    """Формирует текст статистики конкретного чата + топ-5 участников."""
-    row = database.get_chat_stats(chat_id)
-    if not row:
-        return f"❌ Нет данных по чату «{html.escape(chat_title or str(chat_id))}»."
-
-    participants, messages, chars, stickers, photos, videos, voice, gifs, forwards = row
-    title_e = html.escape(chat_title or str(chat_id))
-
-    lines = [
-        f"<b>📊 Статистика «{title_e}»</b>",
-        "",
-        f"👥 Участников в боте: {participants}",
-        f"✉️ Сообщений: {messages}",
-        f"🔠 Символов: {chars}",
-        f"🎟 Стикеров: {stickers}",
-        f"🖼 Фото: {photos}",
-        f"🎬 Видео: {videos}",
-        f"🎤 Голосовых: {voice}",
-        f"🎞 GIF: {gifs}",
-        f"↩️ Пересланных: {forwards}",
-    ]
-
-    # Топ-5 участников этой беседы
-    top_rows, _ = database.get_chat_top_page(chat_id, 0, 5)
-    if top_rows:
-        lines.append("")
-        lines.append("<b>🏆 Топ-5 участников</b>")
-        for i, top_row in enumerate(top_rows, start=1):
-            user_id, username, first_name = top_row[0], top_row[1], top_row[2]
-            stats = top_row[3:]
-            name = build_clickable_name(user_id, username, first_name)
-            lines.append(f"{rank_label(i)} {name} — {_fmt_row_stats(*stats)}")
-
-    return "\n".join(lines)
+    def _send_chat_top(target_chat_id: int, user_id: int, chat_id: int, chat_title: str):
+        text, keyboard, total = _build_chat_page(chat_id, chat_title, 0)
+        sent = safe_send(target_chat_id, text, reply_markup=keyboard)
+        if sent:
+            _pagination[user_id] = {
+                "mode": "chat", "chat_id": chat_id, "chat_title": chat_title,
+                "page": 0, "total": total, "message_id": sent.message_id,
+            }

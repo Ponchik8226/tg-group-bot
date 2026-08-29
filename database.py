@@ -1,21 +1,19 @@
 """
 Всё, что связано с базой данных (PostgreSQL).
 
-Этот модуль не зависит от telebot — принимает и возвращает только простые
-типы (числа, строки, кортежи), чтобы main.py занимался Telegram-логикой,
-а этот файл — только хранением данных.
+Модуль не зависит от telebot — принимает и возвращает только простые типы.
+Если DATABASE_URL не задан (или нет psycopg2), все функции работают как
+no-op и бот продолжает жить в памяти.
 
-Если DATABASE_URL не задан (или не установлен psycopg2), все функции
-работают как no-op — бот продолжает работать только в памяти.
+Соединения берутся из пула. Число одновременных соединений ограничено
+семафором — getconn() у psycopg2 при исчерпании пула не ждёт, а сразу
+бросает PoolError, поэтому очередь мы держим сами.
 
-Подключения к БД управляются через пул (ThreadedConnectionPool):
-- при старте создаётся 1 соединение, максимум 5 одновременных
-- каждая функция берёт соединение из пула и возвращает обратно
-- при обрыве SSL-соединения (Neon засыпает после 5 мин без запросов)
-  функция _run() автоматически закрывает мёртвое соединение, убирает
-  его из пула и делает до 3 повторных попыток с новым соединением
+_run() никогда не пробрасывает исключение наружу: при недоступной БД
+возвращается значение по умолчанию, чтобы бот отвечал пользователю.
 """
 
+import threading
 import time
 
 from config import DATABASE_URL, logger
@@ -23,109 +21,101 @@ from config import DATABASE_URL, logger
 try:
     import psycopg2
     from psycopg2 import pool as psycopg2_pool
+    from psycopg2.extras import execute_values
 except ImportError:
     psycopg2 = None
     psycopg2_pool = None
+    execute_values = None
 
 # =============================================================================
 # ПУЛ СОЕДИНЕНИЙ
 # =============================================================================
 
-# Глобальный пул: инициализируется один раз в init_db().
-# min=1 — одно соединение всегда держится открытым (нет cold start на Neon).
-# max=5 — не более 5 одновременных соединений (хватает для фоновых потоков
-#         статистики + основного потока polling + таймеров).
+MAX_CONNECTIONS = 10
+
 _pool = None
+_pool_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
 
 def db_enabled() -> bool:
-    """True, если задан DATABASE_URL и установлен psycopg2."""
     return bool(DATABASE_URL) and psycopg2 is not None
 
 
+def _ready() -> bool:
+    return db_enabled() and _pool is not None
+
+
 def _init_pool():
-    """
-    Создаёт пул соединений. Если Neon ещё "спит" после паузы —
-    повторяет попытку до 5 раз с паузой 3 секунды.
-    """
     global _pool
     for attempt in range(1, 6):
         try:
             _pool = psycopg2_pool.ThreadedConnectionPool(
-                minconn=1,
-                maxconn=5,
-                dsn=DATABASE_URL,
+                minconn=1, maxconn=MAX_CONNECTIONS, dsn=DATABASE_URL,
             )
-            logger.info("Пул соединений с БД создан.")
+            logger.info("Пул соединений с БД создан (max=%s).", MAX_CONNECTIONS)
             return
         except Exception as e:
             logger.warning(
-                "Попытка %s/5 подключиться к БД не удалась: %s. "
-                "Повтор через 3 секунды...", attempt, e,
+                "Попытка %s/5 подключиться к БД не удалась: %s. Повтор через 3 сек...",
+                attempt, e,
             )
             time.sleep(3)
 
-    logger.error(
-        "Не удалось подключиться к БД после 5 попыток. "
-        "Бот продолжит работу без базы данных."
-    )
-
-
-def _get_conn():
-    """Берёт соединение из пула."""
-    return _pool.getconn()
+    logger.error("Не удалось подключиться к БД. Бот продолжит работу без базы.")
 
 
 def _put_conn(conn, close: bool = False):
-    """
-    Возвращает соединение в пул.
-    close=True — закрыть и убрать из пула (для сломанных соединений).
-    """
-    _pool.putconn(conn, close=close)
+    if _pool is None or conn is None:
+        return
+    try:
+        _pool.putconn(conn, close=close)
+    except Exception:
+        logger.debug("Не удалось вернуть соединение в пул.")
 
 
 # =============================================================================
 # RECONNECT-ХЕЛПЕР
 # =============================================================================
 
-def _run(fn):
+def _run(fn, default=None, retry: bool = True):
     """
-    Выполняет fn(conn) с автоматическим переподключением при обрыве
-    SSL-соединения (Neon засыпает после 5 мин простоя и рвёт TCP).
+    Выполняет fn(conn) с переподключением при обрыве соединения.
 
-    До 3 попыток с паузой 1 сек между ними.
-    Сломанное соединение закрывается и удаляется из пула, пул сам
-    создаёт новое при следующем getconn().
+    retry=False — для неидемпотентных запросов (инкремент/декремент):
+    повтор после разрыва может применить изменение дважды.
     """
-    if _pool is None:
-        logger.error("_run() вызван при _pool=None — пропуск запроса.")
-        return None
+    if not _ready():
+        return default
+
+    attempts = 3 if retry else 1
     last_exc = None
-    for attempt in range(1, 4):
-        conn = _get_conn()
-        try:
-            result = fn(conn)
-            _put_conn(conn)
-            return result
-        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-            last_exc = e
-            logger.warning(
-                "Соединение с БД прервано (попытка %d/3): %s. Переподключение...",
-                attempt, e,
-            )
-            # Закрываем сломанное соединение и убираем его из пула
-            try:
-                _put_conn(conn, close=True)
-            except Exception:
-                pass
-            time.sleep(1)
-        except Exception:
-            # Любая другая ошибка — возвращаем соединение и пробрасываем
-            _put_conn(conn)
-            raise
 
-    logger.error("Не удалось выполнить запрос к БД после 3 попыток: %s", last_exc)
-    raise last_exc
+    with _pool_slots:  # ждём свободный слот вместо PoolError
+        for attempt in range(1, attempts + 1):
+            conn = None
+            try:
+                conn = _pool.getconn()
+                result = fn(conn)
+                _put_conn(conn)
+                return result
+            except (psycopg2.OperationalError,
+                    psycopg2.InterfaceError,
+                    psycopg2_pool.PoolError) as e:
+                last_exc = e
+                logger.warning(
+                    "Соединение с БД прервано (попытка %d/%d): %s",
+                    attempt, attempts, e,
+                )
+                _put_conn(conn, close=True)
+                if attempt < attempts:
+                    time.sleep(1)
+            except Exception:
+                _put_conn(conn)
+                logger.exception("Ошибка запроса к БД.")
+                return default
+
+    logger.error("Запрос к БД не выполнен: %s", last_exc)
+    return default
 
 
 # =============================================================================
@@ -133,11 +123,10 @@ def _run(fn):
 # =============================================================================
 
 def init_db():
-    """Инициализирует пул и создаёт все необходимые таблицы."""
     if not db_enabled():
         logger.warning(
-            "DATABASE_URL не задан — таймеры и статистика не будут "
-            "сохраняться между перезапусками."
+            "DATABASE_URL не задан — таймеры, кнопки и статистика "
+            "не сохраняются между перезапусками."
         )
         return
 
@@ -148,8 +137,7 @@ def init_db():
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS timers (
                         id                SERIAL PRIMARY KEY,
                         chat_id           BIGINT NOT NULL,
@@ -158,10 +146,8 @@ def init_db():
                         description       TEXT NOT NULL DEFAULT '',
                         end_time          DOUBLE PRECISION NOT NULL
                     )
-                    """
-                )
-                cur.execute(
-                    """
+                """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
                         user_id         BIGINT PRIMARY KEY,
                         username        TEXT,
@@ -170,19 +156,15 @@ def init_db():
                         registered_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
                         last_seen_at    TIMESTAMPTZ NOT NULL DEFAULT now()
                     )
-                    """
-                )
-                cur.execute(
-                    """
+                """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS chats (
                         chat_id     BIGINT PRIMARY KEY,
                         chat_type   TEXT NOT NULL,
                         title       TEXT
                     )
-                    """
-                )
-                cur.execute(
-                    """
+                """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS user_chat_stats (
                         user_id         BIGINT NOT NULL REFERENCES users(user_id),
                         chat_id         BIGINT NOT NULL REFERENCES chats(chat_id),
@@ -197,45 +179,28 @@ def init_db():
                         last_seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
                         PRIMARY KEY (user_id, chat_id)
                     )
-                    """
-                )
-                # Добавляем колонку в уже существующую таблицу если её нет.
-                cur.execute(
-                    """
+                """)
+                cur.execute("""
                     ALTER TABLE user_chat_stats
                     ADD COLUMN IF NOT EXISTS forwards_count BIGINT NOT NULL DEFAULT 0
-                    """
-                )
-                # Колонки для повторяющихся таймеров (добавлены в v2)
-                cur.execute(
-                    """
+                """)
+                cur.execute("""
                     ALTER TABLE timers
                     ADD COLUMN IF NOT EXISTS is_recurring BOOLEAN NOT NULL DEFAULT FALSE
-                    """
-                )
-                cur.execute(
-                    """
+                """)
+                cur.execute("""
                     ALTER TABLE timers
                     ADD COLUMN IF NOT EXISTS interval_seconds BIGINT NOT NULL DEFAULT 0
-                    """
-                )
-                # Счётчик оставшихся срабатываний для повторяющихся таймеров (v3)
-                cur.execute(
-                    """
+                """)
+                cur.execute("""
                     ALTER TABLE timers
                     ADD COLUMN IF NOT EXISTS fires_remaining INT NOT NULL DEFAULT 0
-                    """
-                )
-                # ID топика (Forum thread) для отправки уведомления в нужный раздел (v5)
-                cur.execute(
-                    """
+                """)
+                cur.execute("""
                     ALTER TABLE timers
                     ADD COLUMN IF NOT EXISTS thread_id BIGINT
-                    """
-                )
-                # Пользовательские reply-кнопки (v3)
-                cur.execute(
-                    """
+                """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS user_buttons (
                         id          SERIAL PRIMARY KEY,
                         user_id     BIGINT NOT NULL,
@@ -244,28 +209,17 @@ def init_db():
                         created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
                         UNIQUE (user_id, name)
                     )
-                    """
-                )
-                # Миграция: добавляем is_active если таблица уже существовала без неё (v4)
-                cur.execute(
-                    """
+                """)
+                cur.execute("""
                     ALTER TABLE user_buttons
                     ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE
-                    """
-                )
-                # Индексы для частых запросов
-                cur.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_ucs_chat_id "
-                    "ON user_chat_stats (chat_id)"
-                )
-                cur.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_ucs_messages "
-                    "ON user_chat_stats (messages_count DESC)"
-                )
-                cur.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_ub_user_id "
-                    "ON user_buttons (user_id)"
-                )
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_ucs_chat_id "
+                            "ON user_chat_stats (chat_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_ucs_messages "
+                            "ON user_chat_stats (messages_count DESC)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_ub_user_id "
+                            "ON user_buttons (user_id)")
 
     _run(_fn)
 
@@ -274,14 +228,10 @@ def init_db():
 # ТАЙМЕРЫ
 # =============================================================================
 
-def insert_timer(
-    chat_id, user_id, first_name, description, end_time,
-    is_recurring: bool = False, interval_seconds: int = 0,
-    fires_remaining: int = 0, thread_id: int | None = None,
-):
-    """Сохраняет таймер в базу и возвращает его ID (или None без БД)."""
-    if not db_enabled() or _pool is None:
-        return None
+def insert_timer(chat_id, user_id, first_name, description, end_time,
+                 is_recurring=False, interval_seconds=0,
+                 fires_remaining=0, thread_id=None):
+    """Сохраняет таймер и возвращает его ID (None — если БД недоступна)."""
 
     def _fn(conn):
         with conn:
@@ -300,9 +250,8 @@ def insert_timer(
 
 
 def delete_timer(timer_id):
-    """Удаляет таймер из базы."""
-    if not db_enabled() or _pool is None:
-        return
+    if timer_id is None or timer_id < 0:
+        return  # локальный (не сохранённый в БД) таймер
 
     def _fn(conn):
         with conn:
@@ -313,14 +262,6 @@ def delete_timer(timer_id):
 
 
 def load_all_timers():
-    """
-    Возвращает все сохранённые таймеры:
-    (id, chat_id, user_id, first_name, description, end_time,
-     is_recurring, interval_seconds, fires_remaining, thread_id)
-    """
-    if not db_enabled() or _pool is None:
-        return []
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
@@ -332,17 +273,17 @@ def load_all_timers():
                 )
                 return cur.fetchall()
 
-    return _run(_fn)
+    return _run(_fn, default=[])
 
 
-def decrement_timer_fires(timer_id: int) -> int | None:
+def decrement_timer_fires(timer_id: int):
     """
-    Атомарно уменьшает fires_remaining на 1.
-    Возвращает новое значение (0 = лимит исчерпан).
-    None — если БД недоступна (main.py в этом случае считает в памяти).
+    Атомарно уменьшает fires_remaining на 1 и возвращает новое значение.
+    None — считать в памяти (БД недоступна или строки нет).
+    Без ретраев: повтор мог бы уменьшить счётчик дважды.
     """
-    if not db_enabled() or _pool is None:
-        return None  # сигнал: считать в памяти
+    if timer_id < 0:
+        return None
 
     def _fn(conn):
         with conn:
@@ -353,26 +294,20 @@ def decrement_timer_fires(timer_id: int) -> int | None:
                     (timer_id,),
                 )
                 row = cur.fetchone()
-                return row[0] if row else 0
+                return row[0] if row else None
 
-    return _run(_fn)
+    return _run(_fn, retry=False)
 
 
 def update_timer_end_time(timer_id: int, new_end_time: float):
-    """
-    Обновляет время следующего срабатывания таймера.
-    Используется повторяющимися таймерами вместо удаления.
-    """
-    if not db_enabled() or _pool is None:
+    if timer_id < 0:
         return
 
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE timers SET end_time = %s WHERE id = %s",
-                    (new_end_time, timer_id),
-                )
+                cur.execute("UPDATE timers SET end_time = %s WHERE id = %s",
+                            (new_end_time, timer_id))
 
     _run(_fn)
 
@@ -382,12 +317,6 @@ def update_timer_end_time(timer_id: int, new_end_time: float):
 # =============================================================================
 
 def get_user_buttons(user_id: int) -> list:
-    """
-    Возвращает все кнопки пользователя: [(id, name, is_active), ...], отсортированы по id.
-    """
-    if not db_enabled() or _pool is None:
-        return []
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
@@ -398,56 +327,28 @@ def get_user_buttons(user_id: int) -> list:
                 )
                 return cur.fetchall()
 
-    return _run(_fn)
+    return _run(_fn, default=[])
 
 
-def add_user_button(user_id: int, name: str) -> int | None:
-    """
-    Добавляет кнопку пользователю.
-    Возвращает id новой кнопки, или None если кнопка с таким именем уже есть.
-    Реальные ошибки БД пробрасываются наверх (не глотаются как «дубликат»).
-    """
-    if not db_enabled() or _pool is None:
-        return None
+def add_user_button(user_id: int, name: str):
+    """id новой кнопки, или None если дубликат / БД недоступна."""
 
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                # ON CONFLICT DO NOTHING: вернёт строку при вставке, ничего — при дубликате
                 cur.execute(
-                    "INSERT INTO user_buttons (user_id, name) "
-                    "VALUES (%s, %s) ON CONFLICT (user_id, name) DO NOTHING RETURNING id",
+                    "INSERT INTO user_buttons (user_id, name) VALUES (%s, %s) "
+                    "ON CONFLICT (user_id, name) DO NOTHING RETURNING id",
                     (user_id, name),
                 )
                 row = cur.fetchone()
-                return row[0] if row else None  # None = дубликат
-
-    return _run(_fn)
-
-
-def remove_user_button(button_id: int, user_id: int) -> bool:
-    """Удаляет одну кнопку по id. Возвращает True если удалена."""
-    if not db_enabled() or _pool is None:
-        return False
-
-    def _fn(conn):
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM user_buttons WHERE id = %s AND user_id = %s",
-                    (button_id, user_id),
-                )
-                return cur.rowcount > 0
+                return row[0] if row else None
 
     return _run(_fn)
 
 
 def remove_user_buttons(button_ids: list, user_id: int) -> int:
-    """
-    Удаляет несколько кнопок по списку id (все должны принадлежать user_id).
-    Возвращает количество реально удалённых.
-    """
-    if not db_enabled() or _pool is None or not button_ids:
+    if not button_ids:
         return 0
 
     def _fn(conn):
@@ -459,34 +360,20 @@ def remove_user_buttons(button_ids: list, user_id: int) -> int:
                 )
                 return cur.rowcount
 
-    return _run(_fn)
+    return _run(_fn, default=0)
 
 
 def remove_all_user_buttons(user_id: int) -> int:
-    """Удаляет все кнопки пользователя. Возвращает количество удалённых."""
-    if not db_enabled() or _pool is None:
-        return 0
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM user_buttons WHERE user_id = %s",
-                    (user_id,),
-                )
+                cur.execute("DELETE FROM user_buttons WHERE user_id = %s", (user_id,))
                 return cur.rowcount
 
-    return _run(_fn)
+    return _run(_fn, default=0)
 
 
 def set_all_buttons_active(user_id: int, is_active: bool) -> int:
-    """
-    Включает (is_active=True) или отключает (is_active=False) все кнопки пользователя.
-    Возвращает количество затронутых строк.
-    """
-    if not db_enabled() or _pool is None:
-        return 0
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
@@ -496,16 +383,16 @@ def set_all_buttons_active(user_id: int, is_active: bool) -> int:
                 )
                 return cur.rowcount
 
-    return _run(_fn)
+    return _run(_fn, default=0)
 
 
 # =============================================================================
 # СТАТИСТИКА
 # =============================================================================
 
-_UPSERT_USER_SQL = """
+_BULK_USERS_SQL = """
     INSERT INTO users (user_id, username, first_name, last_name, registered_at, last_seen_at)
-    VALUES (%s, %s, %s, %s, now(), now())
+    VALUES %s
     ON CONFLICT (user_id) DO UPDATE SET
         username     = EXCLUDED.username,
         first_name   = EXCLUDED.first_name,
@@ -513,84 +400,62 @@ _UPSERT_USER_SQL = """
         last_seen_at = now()
 """
 
-_UPSERT_CHAT_SQL = """
+_BULK_CHATS_SQL = """
     INSERT INTO chats (chat_id, chat_type, title)
-    VALUES (%s, %s, %s)
+    VALUES %s
     ON CONFLICT (chat_id) DO UPDATE SET
         chat_type = EXCLUDED.chat_type,
         title     = EXCLUDED.title
 """
 
-_UPSERT_STATS_SQL = """
+_BULK_STATS_SQL = """
     INSERT INTO user_chat_stats (
         user_id, chat_id, messages_count, chars_count, stickers_count,
         photos_count, videos_count, voice_count, gifs_count, forwards_count, last_seen_at
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+    VALUES %s
     ON CONFLICT (user_id, chat_id) DO UPDATE SET
-        messages_count  = user_chat_stats.messages_count  + EXCLUDED.messages_count,
-        chars_count     = user_chat_stats.chars_count     + EXCLUDED.chars_count,
-        stickers_count  = user_chat_stats.stickers_count  + EXCLUDED.stickers_count,
-        photos_count    = user_chat_stats.photos_count    + EXCLUDED.photos_count,
-        videos_count    = user_chat_stats.videos_count    + EXCLUDED.videos_count,
-        voice_count     = user_chat_stats.voice_count     + EXCLUDED.voice_count,
-        gifs_count      = user_chat_stats.gifs_count      + EXCLUDED.gifs_count,
-        forwards_count  = user_chat_stats.forwards_count  + EXCLUDED.forwards_count,
-        last_seen_at    = now()
+        messages_count = user_chat_stats.messages_count + EXCLUDED.messages_count,
+        chars_count    = user_chat_stats.chars_count    + EXCLUDED.chars_count,
+        stickers_count = user_chat_stats.stickers_count + EXCLUDED.stickers_count,
+        photos_count   = user_chat_stats.photos_count   + EXCLUDED.photos_count,
+        videos_count   = user_chat_stats.videos_count   + EXCLUDED.videos_count,
+        voice_count    = user_chat_stats.voice_count    + EXCLUDED.voice_count,
+        gifs_count     = user_chat_stats.gifs_count     + EXCLUDED.gifs_count,
+        forwards_count = user_chat_stats.forwards_count + EXCLUDED.forwards_count,
+        last_seen_at   = now()
 """
 
 
-def record_message_stats(
-    user_id, username, first_name, last_name,
-    chat_id, chat_type, chat_title,
-    messages, chars, stickers, photos, videos, voice, gifs, forwards,
-):
-    """Обновляет данные пользователя, чата и счётчики по одному сообщению."""
-    if not db_enabled() or _pool is None:
+def record_message_stats_bulk(users: dict, chats: dict, stats: dict):
+    """
+    Пишет пачку сообщений одной транзакцией.
+
+    users: {user_id: (username, first_name, last_name)}
+    chats: {chat_id: (chat_type, title)}
+    stats: {(user_id, chat_id): [messages, chars, stickers, photos,
+                                 videos, voice, gifs, forwards]}
+
+    Ключи уже уникальны — иначе Postgres ругается на повторное
+    обновление одной строки внутри ON CONFLICT DO UPDATE.
+    """
+    if not stats or execute_values is None:
         return
 
+    user_rows = [(uid, *data) for uid, data in users.items()]
+    chat_rows = [(cid, *data) for cid, data in chats.items()]
+    stat_rows = [(uid, cid, *counters) for (uid, cid), counters in stats.items()]
+
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(_UPSERT_USER_SQL, (user_id, username, first_name, last_name))
-                cur.execute(_UPSERT_CHAT_SQL, (chat_id, chat_type, chat_title))
-                cur.execute(
-                    _UPSERT_STATS_SQL,
-                    (user_id, chat_id, messages, chars, stickers,
-                     photos, videos, voice, gifs, forwards),
-                )
+                execute_values(cur, _BULK_USERS_SQL, user_rows,
+                               template="(%s, %s, %s, %s, now(), now())")
+                execute_values(cur, _BULK_CHATS_SQL, chat_rows)
+                execute_values(cur, _BULK_STATS_SQL, stat_rows,
+                               template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())")
 
     _run(_fn)
-
-
-def get_top_activity(limit=10):
-    """
-    Возвращает топ записей (пользователь, чат) по количеству сообщений:
-    (username, first_name, chat_title, messages, chars, stickers, photos, videos, voice, gifs, forwards)
-    """
-    if not db_enabled() or _pool is None:
-        return []
-
-    def _fn(conn):
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT u.username, u.first_name, c.title,
-                           s.messages_count, s.chars_count, s.stickers_count,
-                           s.photos_count, s.videos_count, s.voice_count, s.gifs_count,
-                           s.forwards_count
-                    FROM user_chat_stats s
-                    JOIN users u ON u.user_id = s.user_id
-                    JOIN chats c ON c.chat_id = s.chat_id
-                    ORDER BY s.messages_count DESC
-                    LIMIT %s
-                    """,
-                    (limit,),
-                )
-                return cur.fetchall()
-
-    return _run(_fn)
 
 
 # =============================================================================
@@ -598,22 +463,12 @@ def get_top_activity(limit=10):
 # =============================================================================
 
 def get_global_top_page(offset: int, limit: int = 10):
-    """
-    Глобальный топ по всем чатам с пагинацией.
-    Возвращает (rows, total_count).
-    rows: (user_id, username, first_name, chat_title, messages, chars,
-           stickers, photos, videos, voice, gifs, forwards)
-    """
-    if not db_enabled() or _pool is None:
-        return [], 0
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM user_chat_stats")
                 total = cur.fetchone()[0]
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT u.user_id, u.username, u.first_name, c.title,
                            s.messages_count, s.chars_count, s.stickers_count,
                            s.photos_count, s.videos_count, s.voice_count,
@@ -623,80 +478,49 @@ def get_global_top_page(offset: int, limit: int = 10):
                     JOIN chats c ON c.chat_id = s.chat_id
                     ORDER BY s.messages_count DESC
                     LIMIT %s OFFSET %s
-                    """,
-                    (limit, offset),
-                )
+                """, (limit, offset))
                 return cur.fetchall(), total
 
-    return _run(_fn)
+    return _run(_fn, default=([], 0))
 
 
 def find_chats_by_name(query: str):
-    """
-    Ищет чаты по частичному совпадению названия (регистронезависимо).
-    Возвращает список (chat_id, title, chat_type).
-    """
-    if not db_enabled() or _pool is None:
-        return []
-
-    # Экранируем спецсимволы LIKE чтобы запрос "100%" не дал неожиданных совпадений
     safe_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT chat_id, title, chat_type
                     FROM chats
                     WHERE LOWER(title) LIKE LOWER(%s) ESCAPE '\\'
                     ORDER BY title
                     LIMIT 10
-                    """,
-                    (f"%{safe_query}%",),
-                )
+                """, (f"%{safe_query}%",))
                 return cur.fetchall()
 
-    return _run(_fn)
+    return _run(_fn, default=[])
 
 
 def get_chat_by_id(chat_id: int):
-    """Возвращает (chat_id, title, chat_type) или None."""
-    if not db_enabled() or _pool is None:
-        return None
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT chat_id, title, chat_type FROM chats WHERE chat_id = %s",
-                    (chat_id,),
-                )
+                cur.execute("SELECT chat_id, title, chat_type FROM chats WHERE chat_id = %s",
+                            (chat_id,))
                 return cur.fetchone()
 
     return _run(_fn)
 
 
 def get_chat_top_page(chat_id: int, offset: int, limit: int = 10):
-    """
-    Топ пользователей в конкретном чате с пагинацией.
-    Возвращает (rows, total_count).
-    rows: (user_id, username, first_name, messages, chars,
-           stickers, photos, videos, voice, gifs, forwards)
-    """
-    if not db_enabled() or _pool is None:
-        return [], 0
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COUNT(*) FROM user_chat_stats WHERE chat_id = %s",
-                    (chat_id,),
-                )
+                cur.execute("SELECT COUNT(*) FROM user_chat_stats WHERE chat_id = %s",
+                            (chat_id,))
                 total = cur.fetchone()[0]
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT u.user_id, u.username, u.first_name,
                            s.messages_count, s.chars_count, s.stickers_count,
                            s.photos_count, s.videos_count, s.voice_count,
@@ -706,78 +530,45 @@ def get_chat_top_page(chat_id: int, offset: int, limit: int = 10):
                     WHERE s.chat_id = %s
                     ORDER BY s.messages_count DESC
                     LIMIT %s OFFSET %s
-                    """,
-                    (chat_id, limit, offset),
-                )
+                """, (chat_id, limit, offset))
                 return cur.fetchall(), total
 
-    return _run(_fn)
+    return _run(_fn, default=([], 0))
 
 
 def get_user_by_id(user_id: int):
-    """
-    Возвращает полную информацию о пользователе:
-    (user_id, username, first_name, last_name, registered_at, last_seen_at)
-    или None если не найден.
-    """
-    if not db_enabled() or _pool is None:
-        return None
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT user_id, username, first_name, last_name,
                            registered_at, last_seen_at
                     FROM users WHERE user_id = %s
-                    """,
-                    (user_id,),
-                )
+                """, (user_id,))
                 return cur.fetchone()
 
     return _run(_fn)
 
 
 def get_user_by_username(username: str):
-    """
-    Ищет пользователя по username (без @, регистронезависимо).
-    Возвращает (user_id, username, first_name, last_name,
-                registered_at, last_seen_at) или None.
-    """
-    if not db_enabled() or _pool is None:
-        return None
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT user_id, username, first_name, last_name,
                            registered_at, last_seen_at
                     FROM users WHERE LOWER(username) = LOWER(%s)
-                    """,
-                    (username,),
-                )
+                """, (username,))
                 return cur.fetchone()
 
     return _run(_fn)
 
 
 def get_user_stats_all_chats(user_id: int):
-    """
-    Возвращает статистику пользователя по всем чатам:
-    список (chat_title, messages, chars, stickers, photos, videos, voice, gifs, forwards)
-    отсортированный по сообщениям.
-    """
-    if not db_enabled() or _pool is None:
-        return []
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT c.title,
                            s.messages_count, s.chars_count, s.stickers_count,
                            s.photos_count, s.videos_count, s.voice_count,
@@ -786,53 +577,32 @@ def get_user_stats_all_chats(user_id: int):
                     JOIN chats c ON c.chat_id = s.chat_id
                     WHERE s.user_id = %s
                     ORDER BY s.messages_count DESC
-                    """,
-                    (user_id,),
-                )
+                """, (user_id,))
                 return cur.fetchall()
 
-    return _run(_fn)
+    return _run(_fn, default=[])
 
 
 def get_chats_count_by_type():
-    """
-    Возвращает (group_count, private_count) — количество бесед и личок.
-    Используется в build_stats_report() (utils.py).
-    """
-    if not db_enabled() or _pool is None:
-        return 0, 0
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT
                         COUNT(*) FILTER (WHERE chat_type != 'private'),
                         COUNT(*) FILTER (WHERE chat_type = 'private')
                     FROM chats
-                    """
-                )
+                """)
                 return cur.fetchone()
 
-    return _run(_fn)
+    return _run(_fn, default=(0, 0))
 
 
 def get_top_activity_groups(limit: int = 5):
-    """
-    Топ пользователей по сообщениям — только из групп (не лички).
-    Возвращает список: (user_id, username, first_name, chat_title,
-                        messages, chars, stickers, photos, videos, voice, gifs, forwards).
-    Используется в build_stats_report() (utils.py).
-    """
-    if not db_enabled() or _pool is None:
-        return []
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT u.user_id, u.username, u.first_name, c.title,
                            s.messages_count, s.chars_count, s.stickers_count,
                            s.photos_count, s.videos_count, s.voice_count,
@@ -843,119 +613,81 @@ def get_top_activity_groups(limit: int = 5):
                     WHERE c.chat_type != 'private'
                     ORDER BY s.messages_count DESC
                     LIMIT %s
-                    """,
-                    (limit,),
-                )
+                """, (limit,))
                 return cur.fetchall()
 
-    return _run(_fn)
+    return _run(_fn, default=[])
 
 
 def get_chats_top_page(offset: int, limit: int = 10):
-    """
-    Топ бесед по суммарной активности с пагинацией (только группы, без личек).
-    Возвращает (rows, total_count).
-    rows: (chat_id, title, messages, chars, stickers, photos, videos, voice, gifs, forwards)
-    Используется в _build_chats_top_page() (admin.py).
-    """
-    if not db_enabled() or _pool is None:
-        return [], 0
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT COUNT(DISTINCT s.chat_id)
                     FROM user_chat_stats s
                     JOIN chats c ON c.chat_id = s.chat_id
                     WHERE c.chat_type != 'private'
-                    """
-                )
+                """)
                 total = cur.fetchone()[0]
-
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT c.chat_id, c.title,
-                           SUM(s.messages_count)  AS messages,
-                           SUM(s.chars_count)      AS chars,
-                           SUM(s.stickers_count)   AS stickers,
-                           SUM(s.photos_count)     AS photos,
-                           SUM(s.videos_count)     AS videos,
-                           SUM(s.voice_count)      AS voice,
-                           SUM(s.gifs_count)       AS gifs,
-                           SUM(s.forwards_count)   AS forwards
+                           SUM(s.messages_count) AS messages,
+                           SUM(s.chars_count)    AS chars,
+                           SUM(s.stickers_count) AS stickers,
+                           SUM(s.photos_count)   AS photos,
+                           SUM(s.videos_count)   AS videos,
+                           SUM(s.voice_count)    AS voice,
+                           SUM(s.gifs_count)     AS gifs,
+                           SUM(s.forwards_count) AS forwards
                     FROM user_chat_stats s
                     JOIN chats c ON c.chat_id = s.chat_id
                     WHERE c.chat_type != 'private'
                     GROUP BY c.chat_id, c.title
                     ORDER BY messages DESC
                     LIMIT %s OFFSET %s
-                    """,
-                    (limit, offset),
-                )
+                """, (limit, offset))
                 return cur.fetchall(), total
 
-    return _run(_fn)
+    return _run(_fn, default=([], 0))
 
 
 def get_chat_stats(chat_id: int):
-    """
-    Агрегированная статистика по конкретному чату.
-    Возвращает (participants, messages, chars, stickers, photos, videos, voice, gifs, forwards)
-    или None если чат не найден / нет данных.
-    Используется в _build_chat_stats_text() (admin.py).
-    """
-    if not db_enabled() or _pool is None:
-        return None
-
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT
-                        COUNT(DISTINCT user_id)     AS participants,
-                        SUM(messages_count)         AS messages,
-                        SUM(chars_count)            AS chars,
-                        SUM(stickers_count)         AS stickers,
-                        SUM(photos_count)           AS photos,
-                        SUM(videos_count)           AS videos,
-                        SUM(voice_count)            AS voice,
-                        SUM(gifs_count)             AS gifs,
-                        SUM(forwards_count)         AS forwards
+                        COUNT(DISTINCT user_id),
+                        COALESCE(SUM(messages_count), 0),
+                        COALESCE(SUM(chars_count),    0),
+                        COALESCE(SUM(stickers_count), 0),
+                        COALESCE(SUM(photos_count),   0),
+                        COALESCE(SUM(videos_count),   0),
+                        COALESCE(SUM(voice_count),    0),
+                        COALESCE(SUM(gifs_count),     0),
+                        COALESCE(SUM(forwards_count), 0)
                     FROM user_chat_stats
                     WHERE chat_id = %s
-                    """,
-                    (chat_id,),
-                )
+                """, (chat_id,))
                 row = cur.fetchone()
-                # Если нет строк или все счётчики NULL (чат есть, но нет сообщений)
-                if row is None or row[0] == 0:
-                    return None
-                return row
+                return None if row is None or row[0] == 0 else row
 
     return _run(_fn)
 
 
 def get_stats_overview():
-    """Возвращает (total_users, total_chats, totals_dict) с суммарными счётчиками."""
-    if not db_enabled() or _pool is None:
-        return 0, 0, {k: 0 for k in
-                      ("messages", "chars", "stickers", "photos",
-                       "videos", "voice", "gifs", "forwards")}
+    empty = {k: 0 for k in ("messages", "chars", "stickers", "photos",
+                            "videos", "voice", "gifs", "forwards")}
 
     def _fn(conn):
         with conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM users")
                 total_users = cur.fetchone()[0]
-
                 cur.execute("SELECT COUNT(*) FROM chats")
                 total_chats = cur.fetchone()[0]
-
-                cur.execute(
-                    """
+                cur.execute("""
                     SELECT
                         COALESCE(SUM(messages_count), 0),
                         COALESCE(SUM(chars_count),    0),
@@ -966,17 +698,12 @@ def get_stats_overview():
                         COALESCE(SUM(gifs_count),     0),
                         COALESCE(SUM(forwards_count), 0)
                     FROM user_chat_stats
-                    """
-                )
-                (
-                    messages, chars, stickers,
-                    photos, videos, voice, gifs, forwards,
-                ) = cur.fetchone()
-
+                """)
+                messages, chars, stickers, photos, videos, voice, gifs, forwards = cur.fetchone()
                 return total_users, total_chats, {
                     "messages": messages, "chars": chars, "stickers": stickers,
                     "photos": photos, "videos": videos, "voice": voice,
                     "gifs": gifs, "forwards": forwards,
                 }
 
-    return _run(_fn)
+    return _run(_fn, default=(0, 0, empty))
